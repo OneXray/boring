@@ -17,11 +17,61 @@ pub enum ClientFingerprint {
     Chrome120,
 }
 
+// A closed, bounded catalog, not user-supplied extension/cipher data. The native
+// ID selects only encoding rules that existing BoringSSL APIs cannot express.
+// Real key generation, negotiation, transcript and certificate proof stay native.
+struct Profile {
+    native_id: u32,
+    ciphers: &'static str,
+    groups: &'static [u16],
+    key_shares: &'static [u16],
+    signatures: &'static str,
+    grease: bool,
+    shuffle: bool,
+    sct: bool,
+    ech_grease: bool,
+    alps_new_codepoint: Option<bool>,
+    brotli: bool,
+}
+
+impl ClientFingerprint {
+    fn profile(self) -> &'static Profile {
+        match self {
+            Self::Chrome120 => &CHROME120,
+        }
+    }
+}
+
+const CHROME120: Profile = Profile {
+    native_id: 1,
+    ciphers: concat!(
+        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:",
+        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:",
+        "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:",
+        "ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:",
+        "AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA"
+    ),
+    groups: &[29, 23, 24],
+    key_shares: &[29],
+    signatures: concat!(
+        "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:",
+        "ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:",
+        "rsa_pss_rsae_sha512:rsa_pkcs1_sha512"
+    ),
+    grease: true,
+    shuffle: true,
+    sct: true,
+    ech_grease: true,
+    alps_new_codepoint: Some(false),
+    brotli: true,
+};
+
 /// Immutable profile plus caller-configured TLS trust, versions and identity.
 /// Each connection supplies its transport ALPN; no profile can override it.
 #[derive(Debug, Clone)]
 pub struct FingerprintConnector {
     connector: SslConnector,
+    profile: ClientFingerprint,
 }
 
 impl FingerprintConnector {
@@ -32,35 +82,30 @@ impl FingerprintConnector {
         mut builder: SslConnectorBuilder,
         profile: ClientFingerprint,
     ) -> Result<Self, ErrorStack> {
-        match profile {
-            ClientFingerprint::Chrome120 => {
-                builder.set_strict_cipher_list(concat!(
-                    "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:",
-                    "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:",
-                    "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:",
-                    "ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:",
-                    "AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA"
-                ))?;
-                builder.set_curves_list("X25519:P-256:P-384")?;
-                builder.set_sigalgs_list(concat!(
-                    "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:",
-                    "ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:",
-                    "rsa_pss_rsae_sha512:rsa_pkcs1_sha512"
-                ))?;
-                builder.set_grease_enabled(true);
-                builder.set_permute_extensions(true);
-                builder.enable_signed_cert_timestamps();
-                builder.enable_ocsp_stapling();
-                builder.add_certificate_compression_algorithm(Brotli)?;
-                // Native checks the declared size before allocating decompression
-                // output; the Rust decoder also enforces the same output bound.
-                unsafe {
-                    ffi::SSL_CTX_set_max_cert_list(builder.as_ptr(), MAX_CERTIFICATE_BYTES);
-                }
-            }
+        let spec = profile.profile();
+        builder.set_strict_cipher_list(spec.ciphers)?;
+        builder.set_sigalgs_list(spec.signatures)?;
+        builder.set_grease_enabled(spec.grease);
+        builder.set_permute_extensions(spec.shuffle);
+        if spec.sct {
+            builder.enable_signed_cert_timestamps();
+        }
+        builder.enable_ocsp_stapling();
+        if spec.brotli {
+            builder.add_certificate_compression_algorithm(Brotli)?;
+        }
+        // These setters copy bounded static values; native code validates IDs.
+        unsafe {
+            cvt(ffi::SSL_CTX_set1_group_ids(
+                builder.as_ptr(),
+                spec.groups.as_ptr(),
+                spec.groups.len(),
+            ))?;
+            ffi::SSL_CTX_set_max_cert_list(builder.as_ptr(), MAX_CERTIFICATE_BYTES);
         }
         Ok(Self {
             connector: builder.build(),
+            profile,
         })
     }
 
@@ -70,8 +115,20 @@ impl FingerprintConnector {
     /// interfaces. Do not subsequently override its ALPN/profile settings.
     pub fn configure(&self, alpn: &[u8]) -> Result<ConnectConfiguration, ErrorStack> {
         let mut config = self.connector.configure()?;
+        let spec = self.profile.profile();
+        unsafe {
+            cvt(ffi::SSL_set_client_fingerprint(
+                config.as_ptr(),
+                spec.native_id,
+            ))?;
+            cvt(ffi::SSL_set1_client_key_shares(
+                config.as_ptr(),
+                spec.key_shares.as_ptr(),
+                spec.key_shares.len(),
+            ))?;
+        }
         config.set_alpn_protos(alpn)?;
-        config.set_enable_ech_grease(true);
+        config.set_enable_ech_grease(spec.ech_grease);
         let mut protocols = alpn;
         let mut offers_h2 = false;
         while let Some((&length, tail)) = protocols.split_first() {
@@ -82,9 +139,9 @@ impl FingerprintConnector {
             offers_h2 |= protocol == b"h2";
             protocols = rest;
         }
-        if offers_h2 {
+        if let Some(new_codepoint) = spec.alps_new_codepoint.filter(|_| offers_h2) {
             unsafe {
-                ffi::SSL_set_alps_use_new_codepoint(config.as_ptr(), 0);
+                ffi::SSL_set_alps_use_new_codepoint(config.as_ptr(), new_codepoint.into());
                 cvt(ffi::SSL_add_application_settings(
                     config.as_ptr(),
                     b"h2".as_ptr(),

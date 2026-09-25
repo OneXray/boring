@@ -526,6 +526,12 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
         apply_patch(config, "relax-cert-validation.patch")?;
     }
 
+    if config.features.client_fingerprint {
+        println!("cargo:rerun-if-changed=patches/client-fingerprint.patch");
+        println!("cargo:warning=applying opt-in named client profile encoding patch");
+        apply_patch(config, "client-fingerprint.patch")?;
+    }
+
     if config.features.reality {
         println!("cargo:rerun-if-changed=patches/reality-client.patch");
         println!("cargo:warning=applying opt-in classic REALITY client patch");

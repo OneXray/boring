@@ -37,6 +37,54 @@ fn server() -> SslAcceptorBuilder {
 }
 
 #[tokio::test]
+async fn chrome120_retains_caller_tls_versions_and_real_application_data() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
+            let mut peer = server();
+            peer.set_min_proto_version(Some(version)).unwrap();
+            peer.set_max_proto_version(Some(version)).unwrap();
+            let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+            builder.set_min_proto_version(Some(version)).unwrap();
+            builder.set_max_proto_version(Some(version)).unwrap();
+            builder.set_custom_verify_callback(SslVerifyMode::PEER, |_| Ok(()));
+            let connector =
+                FingerprintConnector::new(builder, ClientFingerprint::Chrome120).unwrap();
+            // Two fresh handshakes through the same connector. No implicit
+            // process-wide cache or test-only connector replaces production.
+            for _ in 0..2 {
+                let (io, remote) = tokio::io::duplex(4096);
+                let acceptor = peer.build();
+                let task = tokio::spawn(async move {
+                    let mut tls = tokio_boring::accept(&acceptor, remote).await.unwrap();
+                    let mut input = [0; 15];
+                    tls.read_exact(&mut input).await.unwrap();
+                    assert_eq!(&input, b"profile-request");
+                    tls.write_all(b"profile-response").await.unwrap();
+                    acceptor
+                });
+                let mut config = connector.configure(b"\x02h2").unwrap();
+                config.set_verify_hostname(false);
+                let mut tls = tokio_boring::connect(config, "profile.test", io)
+                    .await
+                    .unwrap();
+                assert_eq!(tls.ssl().version2(), Some(version));
+                tls.write_all(b"profile-request").await.unwrap();
+                let mut response = [0; 16];
+                tls.read_exact(&mut response).await.unwrap();
+                assert_eq!(&response, b"profile-response");
+                // The server context need not be reused to test fresh requests.
+                task.await.unwrap();
+                peer = server();
+                peer.set_min_proto_version(Some(version)).unwrap();
+                peer.set_max_proto_version(Some(version)).unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn named_profile_exposes_negotiated_peer_alps_not_just_the_advertisement() {
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         for settings in [

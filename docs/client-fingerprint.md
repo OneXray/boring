@@ -60,6 +60,20 @@ This is TLS ClientHello shaping, not HTTP/2/browser runtime impersonation, actua
 ECH, QUIC/H3 shaping, or a claim that all Mihomo client-fingerprint names work.
 Default builds do not enable either new feature.
 
+The feature now forwards to `boring-sys/client-fingerprint`, which applies a
+small bundled-source patch. It exposes only an implemented native profile ID,
+never arbitrary extension bytes. Stream-client configuration is checked before
+IO; DTLS, QUIC, already-started or repeated native selection fails. FIPS, RPK and
+external/precompiled BoringSSL are rejected at build time. Profiles share one
+bounded internal catalog for cipher/signature lists, ordered groups and separate
+key shares, permutation, ECH, ALPS codepoint and compression. Chrome120 is still
+the only implemented public profile; this is not four-template completion.
+
+TLS1.3 cipher order and Chrome ECH GREASE AEAD are fixed by the named template,
+not CPU AES acceleration. Real native cipher filtering, key generation,
+transcript and proof-of-key remain intact. No BIO rewriting or global state is
+introduced; the unconfigured native path is unchanged.
+
 Targeted checks create only memory streams, including real native TLS peers:
 
 ```sh
@@ -75,7 +89,7 @@ work. The tests above exercise the new named interface. Application wiring,
 portable pinned Git dependency resolution, device behavior and release review are
 separate gates; passing these library tests does not complete those gates.
 
-### Local result — 2026-09-25
+### Historical initial-interface result — 2026-09-25
 
 On macOS ARM64, the current named interface passed one wire-profile test, eight
 REALITY tests (including the named-profile authentication case), nine existing

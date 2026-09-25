@@ -19,6 +19,7 @@ pub(crate) struct Config {
 
 pub(crate) struct Features {
     pub(crate) reality: bool,
+    pub(crate) client_fingerprint: bool,
     pub(crate) fips: bool,
     pub(crate) rpk: bool,
     pub(crate) underscore_wildcards: bool,
@@ -101,7 +102,7 @@ impl Config {
     }
 
     fn check_feature_compatibility(&self) -> Result<(), &'static str> {
-        if self.features.reality
+        if (self.features.reality || self.features.client_fingerprint)
             && (self.features.fips
                 || self.features.rpk
                 || self.env.path.is_some()
@@ -109,7 +110,7 @@ impl Config {
                 || self.env.include_path.is_some()
                 || self.env.assume_patched)
         {
-            return Err("`reality` requires the bundled patched non-FIPS, X509 BoringSSL source");
+            return Err("`reality`/`client-fingerprint` require the bundled patched non-FIPS, X509 BoringSSL source");
         }
         if self.features.fips && self.features.rpk {
             return Err("`fips` and `rpk` features are mutually exclusive");
@@ -128,6 +129,7 @@ impl Config {
 
         let features_with_patches_enabled = self.features.rpk
             || self.features.reality
+            || self.features.client_fingerprint
             || self.features.underscore_wildcards
             || self.features.relax_cert_validation;
 
@@ -150,6 +152,7 @@ impl Features {
     fn from_env() -> Self {
         Self {
             reality: cfg!(feature = "reality"),
+            client_fingerprint: cfg!(feature = "client-fingerprint"),
             fips: cfg!(feature = "fips"),
             rpk: cfg!(feature = "rpk"),
             underscore_wildcards: cfg!(feature = "underscore-wildcards"),
