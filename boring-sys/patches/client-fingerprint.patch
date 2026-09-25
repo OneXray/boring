@@ -8,7 +8,7 @@ diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
 -// SSL_max_seal_overhead returns the maximum overhead, in bytes, of sealing a
 -// record with |ssl|.
 +// Opt-in named profile encoding from this fork. Only built-in, implemented
-+// profile IDs are accepted (1 = Chrome120). Trust, ALPN, versions and sessions
++// profile IDs are accepted (1 = Chrome120, 2 = Chrome133). Trust and sessions
 +// remain caller-owned. Fresh stream clients only; no raw ClientHello API.
 +OPENSSL_EXPORT int SSL_set_client_fingerprint(SSL *ssl, unsigned profile);
 +
@@ -50,7 +50,7 @@ diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
 +  if (!ssl || !ssl->config || ssl->server || SSL_is_dtls(ssl) || SSL_is_quic(ssl) ||
 +      ssl->s3->initial_handshake_complete ||
 +      (ssl->s3->hs != nullptr && ssl->s3->hs->max_version != 0) ||
-+      ssl->config->client_fingerprint != 0 || profile != 1) {
++      ssl->config->client_fingerprint != 0 || profile < 1 || profile > 2) {
 +    OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
 +    return 0;
 +  }
@@ -101,3 +101,18 @@ diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
    const EVP_HPKE_AEAD *aead =
        has_aes_hw ? EVP_hpke_aes_128_gcm() : EVP_hpke_chacha20_poly1305();
    static_assert(ssl_grease_ech_config_id < sizeof(hs->grease_seed),
+diff --git a/ssl/extensions.cc b/ssl/extensions.cc
+--- a/ssl/extensions.cc
++++ b/ssl/extensions.cc
+@@ -4520,8 +4520,9 @@
+   // bugs. We also apply this padding to ClientHelloOuter, to keep the wire
+   // images aligned.
+   size_t psk_len = ext_pre_shared_key_clienthello_length(hs, type);
+-  if (!SSL_is_dtls(ssl) && !SSL_is_quic(ssl) &&
+-      !ssl->s3->used_hello_retry_request) {
++  if (!SSL_is_dtls(ssl) && !SSL_is_quic(ssl) &&
++      hs->config->client_fingerprint != 2 &&
++      !ssl->s3->used_hello_retry_request) {
+     msg_len += 2 /* length prefix */ + CBB_len(&extensions) + psk_len;
+     // The length of the padding extension, excluding the four-byte extension
+     // header.

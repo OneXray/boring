@@ -1,8 +1,10 @@
 # Named ClientHello profiles
 
 Enable `boring/client-fingerprint` or `tokio-boring/client-fingerprint` on this
-fork. The first supported profile is `ClientFingerprint::Chrome120`, a pinned
-classic X25519 profile, not an alias for the latest Chrome. Unknown profile names
+fork. The implemented profiles are `ClientFingerprint::Chrome120` (classic
+X25519) and `ClientFingerprint::Chrome133` (ordinary TLS with native
+X25519MLKEM768 and X25519 shares, new ALPS and no padding). Both are fixed
+templates, not aliases following a browser release automatically. Unknown profile names
 must be rejected by applications; this library does not silently map them to a
 different browser.
 
@@ -34,7 +36,7 @@ verification and opt-in REALITY use their normal connection-level interfaces.
 Restricting TLS versions or ALPN intentionally changes the resulting wire shape.
 
 The profile configures ciphers, supported groups, signature algorithms, GREASE,
-extension permutation, SCT/OCSP, ECH GREASE and old-codepoint h2 ALPS. Certificate
+extension permutation, SCT/OCSP, ECH GREASE and template-specific h2 ALPS. Certificate
 compression is real Brotli decompression, not an advertised-only extension. The
 native certificate-message allocation and decoder output are bounded to 128 KiB.
 The profile does not disable certificate verification, weaken handshake signature
@@ -54,6 +56,9 @@ exception and native CertificateVerify checks remain in the native handshake.
 The full connection-local invariants and deliberately unsupported combinations
 are documented in [REALITY](reality-client.md).
 
+CF2 validates Chrome133 only for ordinary TLS. Its classic REALITY shape and
+authentication integration remain CF4 work; ordinary-TLS ML-KEM is not PQ REALITY.
+
 ## Scope and verification
 
 This is TLS ClientHello shaping, not HTTP/2/browser runtime impersonation, actual
@@ -66,8 +71,8 @@ never arbitrary extension bytes. Stream-client configuration is checked before
 IO; DTLS, QUIC, already-started or repeated native selection fails. FIPS, RPK and
 external/precompiled BoringSSL are rejected at build time. Profiles share one
 bounded internal catalog for cipher/signature lists, ordered groups and separate
-key shares, permutation, ECH, ALPS codepoint and compression. Chrome120 is still
-the only implemented public profile; this is not four-template completion.
+key shares, permutation, ECH, ALPS codepoint and compression. Firefox and Safari
+are not implemented yet; this is not four-template completion.
 
 TLS1.3 cipher order and Chrome ECH GREASE AEAD are fixed by the named template,
 not CPU AES acceleration. Real native cipher filtering, key generation,

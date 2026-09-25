@@ -15,6 +15,9 @@ pub enum ClientFingerprint {
     /// Chrome 120's classic X25519 profile. Transport ALPN remains caller-owned.
     /// This does not emulate HTTP/2 settings, QUIC, actual ECH or browser runtime.
     Chrome120,
+    /// Chrome 133 with native X25519MLKEM768 + X25519 shares and new h2 ALPS.
+    /// This is ordinary stream TLS, not PQ REALITY or QUIC impersonation.
+    Chrome133,
 }
 
 // A closed, bounded catalog, not user-supplied extension/cipher data. The native
@@ -38,6 +41,7 @@ impl ClientFingerprint {
     fn profile(self) -> &'static Profile {
         match self {
             Self::Chrome120 => &CHROME120,
+            Self::Chrome133 => &CHROME133,
         }
     }
 }
@@ -64,6 +68,14 @@ const CHROME120: Profile = Profile {
     ech_grease: true,
     alps_new_codepoint: Some(false),
     brotli: true,
+};
+
+const CHROME133: Profile = Profile {
+    native_id: 2,
+    groups: &[4588, 29, 23, 24],
+    key_shares: &[4588, 29],
+    alps_new_codepoint: Some(true),
+    ..CHROME120
 };
 
 /// Immutable profile plus caller-configured TLS trust, versions and identity.
