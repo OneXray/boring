@@ -89,6 +89,39 @@ fn ecdsa_certificate(server: &mut SslAcceptorBuilder) {
     server.set_private_key(&key).unwrap();
 }
 
+#[tokio::test]
+async fn tls12_ticket_lifetime_hint_is_distinct_from_native_session_timeout() {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let acceptor = server(SslVersion::TLS1_2, "X25519");
+        // SAFETY: the builder exclusively owns a live SSL_CTX; no handshake
+        // exists yet. This changes only the controlled memory peer's lifetime.
+        unsafe {
+            boring_sys::SSL_CTX_set_timeout(acceptor.as_ptr(), 2);
+        }
+        let sessions = Arc::new(Mutex::new(Vec::<SslSession>::new()));
+        let saved = sessions.clone();
+        let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+        builder.set_verify(SslVerifyMode::NONE);
+        builder
+            .set_session_cache_mode(SslSessionCacheMode::CLIENT | SslSessionCacheMode::NO_INTERNAL);
+        builder.set_new_session_callback(move |_, session| saved.lock().unwrap().push(session));
+        let connector = FingerprintConnector::new(builder, ClientFingerprint::Chrome120).unwrap();
+        let (io, peer) = tokio::io::duplex(4096);
+        let acceptor = acceptor.build();
+        let (client, server) = tokio::join!(
+            tokio_boring::connect(connector.configure(b"\x02h2").unwrap(), "profile.test", io),
+            tokio_boring::accept(&acceptor, peer)
+        );
+        assert!(client.is_ok() && server.is_ok());
+        let sessions = sessions.lock().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].ticket_lifetime_hint(), 2);
+        assert!(sessions[0].timeout() > 2);
+    })
+    .await
+    .unwrap();
+}
+
 async fn exchange_profile(
     profile: ClientFingerprint,
     version: SslVersion,

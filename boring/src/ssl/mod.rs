@@ -2775,6 +2775,17 @@ impl SslSessionRef {
         unsafe { ffi::SSL_SESSION_get_timeout(self.as_ptr()) }
     }
 
+    /// Returns the server's TLS 1.2 ticket lifetime hint, in seconds.
+    ///
+    /// Zero means no hint. This may be shorter than [`Self::timeout`]; an
+    /// external cache can use the nonzero minimum for its own expiry policy.
+    /// TLS 1.3 ticket lifetimes are already reflected in [`Self::timeout`].
+    #[corresponds(SSL_SESSION_get_ticket_lifetime_hint)]
+    #[must_use]
+    pub fn ticket_lifetime_hint(&self) -> u32 {
+        unsafe { ffi::SSL_SESSION_get_ticket_lifetime_hint(self.as_ptr()) }
+    }
+
     /// Returns the session's TLS protocol version.
     #[corresponds(SSL_SESSION_get_protocol_version)]
     #[must_use]
