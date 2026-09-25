@@ -113,6 +113,10 @@ pub use self::connector::{
 pub use self::credential::{SslCredential, SslCredentialBuilder, SslCredentialRef};
 pub use self::ech::{SslEchKeys, SslEchKeysRef};
 pub use self::error::{Error, ErrorCode, HandshakeError};
+#[cfg(feature = "client-fingerprint")]
+pub use self::fingerprint::{ClientFingerprint, FingerprintConnector};
+#[cfg(feature = "reality")]
+pub use self::reality::RealityClientConfig;
 
 mod async_callbacks;
 mod bio;
@@ -122,7 +126,11 @@ mod connector;
 mod credential;
 mod ech;
 mod error;
+#[cfg(feature = "client-fingerprint")]
+mod fingerprint;
 mod mut_only;
+#[cfg(feature = "reality")]
+mod reality;
 #[cfg(test)]
 mod test;
 

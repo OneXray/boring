@@ -1,0 +1,437 @@
+#![cfg(feature = "reality")]
+
+// Public-interface tests only. No sockets or host listeners are created.
+use boring::{
+    derive::Deriver,
+    hash::MessageDigest,
+    hkdf::HkdfSuite,
+    pkey::{Id, PKey, Private},
+    ssl::{ErrorCode, RealityClientConfig, Ssl, SslContext, SslMethod, SslStream, SslVersion},
+    symm::{decrypt_aead, Cipher},
+};
+use std::collections::VecDeque;
+use std::io::{self, Read, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Default)]
+struct Capture {
+    wire: Vec<u8>,
+    budget: usize,
+    incoming: VecDeque<u8>,
+}
+impl Read for Capture {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.incoming.is_empty() {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        let count = buffer.len().min(self.incoming.len());
+        for byte in &mut buffer[..count] {
+            *byte = self.incoming.pop_front().unwrap();
+        }
+        Ok(count)
+    }
+}
+impl Write for Capture {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.budget == 0 {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        let count = self.budget.min(data.len());
+        self.wire.extend_from_slice(&data[..count]);
+        self.budget -= count;
+        Ok(count)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn parameters() -> (PKey<Private>, RealityClientConfig) {
+    let server = PKey::generate(Id::X25519).unwrap();
+    let mut public = [0; 32];
+    server.raw_public_key(&mut public).unwrap();
+    let config = RealityClientConfig::new(public, &[0xab, 0xcd], [1, 8, 0]).unwrap();
+    (server, config)
+}
+
+fn client(config: &RealityClientConfig) -> Ssl {
+    let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
+    ctx.set_min_proto_version(Some(SslVersion::TLS1_2)).unwrap();
+    ctx.set_max_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+    ctx.set_curves_list("X25519:P-256:P-384").unwrap();
+    ctx.set_grease_enabled(true);
+    ctx.set_permute_extensions(true);
+    let mut ssl = Ssl::new(&ctx.build()).unwrap();
+    ssl.set_hostname("reality.test").unwrap();
+    ssl.set_reality_client(config).unwrap();
+    ssl
+}
+
+fn capture(ssl: Ssl) -> SslStream<Capture> {
+    SslStream::new(
+        ssl,
+        Capture {
+            budget: usize::MAX,
+            ..Capture::default()
+        },
+    )
+    .unwrap()
+}
+
+fn hello(wire: &[u8]) -> Vec<u8> {
+    assert_eq!(wire[0], 22);
+    let n = u16::from_be_bytes(wire[3..5].try_into().unwrap()) as usize;
+    let msg = wire[5..5 + n].to_vec();
+    assert_eq!(msg[0], 1);
+    assert_eq!(msg[38], 32);
+    msg
+}
+
+fn u16_at(bytes: &[u8], i: usize) -> usize {
+    u16::from_be_bytes(bytes[i..i + 2].try_into().unwrap()) as usize
+}
+
+fn wire_auth_key(server: &PKey<Private>, msg: &[u8]) -> [u8; 32] {
+    let mut cursor = 71;
+    cursor += 2 + u16_at(msg, cursor);
+    cursor += 1 + msg[cursor] as usize;
+    let end = cursor + 2 + u16_at(msg, cursor);
+    cursor += 2;
+    let mut public = None;
+    while cursor < end {
+        let kind = u16_at(msg, cursor);
+        let len = u16_at(msg, cursor + 2);
+        cursor += 4;
+        if kind == 51 {
+            let mut share = cursor + 2;
+            while share < cursor + len {
+                let group = u16_at(msg, share);
+                let size = u16_at(msg, share + 2);
+                if group == 29 {
+                    assert_eq!(size, 32);
+                    public = Some(&msg[share + 4..share + 4 + size]);
+                }
+                share += 4 + size;
+            }
+        }
+        cursor += len;
+    }
+    // Independent server-side derivation from only its key and the wire share.
+    let mut spki = vec![
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0,
+    ];
+    spki.extend_from_slice(public.unwrap());
+    let peer = PKey::public_key_from_der(&spki).unwrap();
+    let mut derive = Deriver::new(server).unwrap();
+    derive.set_peer(&peer).unwrap();
+    let shared = derive.derive_to_vec().unwrap();
+    let hkdf = HkdfSuite::new(MessageDigest::sha256());
+    let prk = hkdf.extract(&msg[6..26], &shared).unwrap();
+    let mut key = [0; 32];
+    hkdf.expand(&prk, b"REALITY", &mut key).unwrap();
+    key
+}
+
+fn authenticate_hello(server: &PKey<Private>, msg: &[u8]) {
+    let key = wire_auth_key(server, msg);
+    let mut aad = msg.to_vec();
+    aad[39..71].fill(0);
+    let plain = decrypt_aead(
+        Cipher::aes_256_gcm(),
+        &key,
+        Some(&msg[26..38]),
+        &aad,
+        &msg[39..55],
+        &msg[55..71],
+    )
+    .unwrap();
+    assert_eq!(&plain[..4], &[1, 8, 0, 0]);
+    assert_eq!(&plain[8..], &[0xab, 0xcd, 0, 0, 0, 0, 0, 0]);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let timestamp = u32::from_be_bytes(plain[4..8].try_into().unwrap()) as u64;
+    assert!(timestamp.abs_diff(now) < 30);
+    aad[6] ^= 1;
+    assert!(decrypt_aead(
+        Cipher::aes_256_gcm(),
+        &key,
+        Some(&msg[26..38]),
+        &aad,
+        &msg[39..55],
+        &msg[55..71]
+    )
+    .is_err());
+}
+
+#[test]
+fn hello_authenticates_wire_key_share_and_final_aad() {
+    let (server, config) = parameters();
+    let mut stream = capture(client(&config));
+    assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::WANT_READ);
+    authenticate_hello(&server, &hello(&stream.get_ref().wire));
+}
+
+#[cfg(feature = "client-fingerprint")]
+#[test]
+fn named_profile_preserves_reality_wire_authentication() {
+    use boring::ssl::{ClientFingerprint, FingerprintConnector, SslConnector};
+    let (server, config) = parameters();
+    let connector = FingerprintConnector::new(
+        SslConnector::builder(SslMethod::tls()).unwrap(),
+        ClientFingerprint::Chrome120,
+    )
+    .unwrap();
+    let mut connection = connector.configure(b"\x02h2\x08http/1.1").unwrap();
+    connection.set_reality_client(&config).unwrap();
+    let mut stream = capture(connection.into_ssl("reality.test").unwrap());
+    assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::WANT_READ);
+    authenticate_hello(&server, &hello(&stream.get_ref().wire));
+}
+
+#[test]
+fn retry_does_not_reseal_and_cancel_does_not_reuse_state() {
+    let (server, config) = parameters();
+    let mut stream = capture(client(&config));
+    stream.get_mut().budget = 7;
+    assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::WANT_WRITE);
+    stream.get_mut().budget = usize::MAX;
+    assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::WANT_READ);
+    let first = stream.get_ref().wire.clone();
+    assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::WANT_READ);
+    assert_eq!(stream.get_ref().wire, first);
+    authenticate_hello(&server, &hello(&first));
+    assert!(stream.ssl_mut().set_reality_client(&config).is_err());
+    drop(stream);
+    for _ in 0..16 {
+        let mut next = capture(client(&config));
+        assert_eq!(next.connect().unwrap_err().code(), ErrorCode::WANT_READ);
+        let next_hello = hello(&next.get_ref().wire);
+        assert_ne!(&next_hello[6..71], &hello(&first)[6..71]);
+        authenticate_hello(&server, &next_hello);
+    }
+}
+
+#[test]
+fn low_order_key_emits_no_client_hello() {
+    for low_order in [[0; 32], {
+        let mut k = [0; 32];
+        k[0] = 1;
+        k
+    }] {
+        let config = RealityClientConfig::new(low_order, &[], [1, 8, 0]).unwrap();
+        let mut stream = capture(client(&config));
+        assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::SSL);
+        assert!(stream.get_ref().wire.is_empty());
+    }
+}
+
+#[test]
+fn invalid_configuration_is_rejected_before_sending() {
+    assert!(RealityClientConfig::new([2; 32], &[0; 9], [1, 8, 0]).is_err());
+    let (_, config) = parameters();
+    let mut ssl = client(&config);
+    assert!(ssl.set_reality_client(&config).is_err());
+    ssl.set_max_proto_version(Some(SslVersion::TLS1_2)).unwrap();
+    let mut stream = capture(ssl);
+    assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::SSL);
+    assert!(stream.get_ref().wire.is_empty());
+    let ssl = client(&config);
+    let mut stream = capture(ssl);
+    assert_eq!(stream.accept().unwrap_err().code(), ErrorCode::SSL);
+    assert!(stream.get_ref().wire.is_empty());
+}
+
+#[test]
+fn dtls_and_changed_key_share_configuration_fail_closed() {
+    let (_, config) = parameters();
+    let ctx = SslContext::builder(SslMethod::dtls()).unwrap().build();
+    assert!(Ssl::new(&ctx).unwrap().set_reality_client(&config).is_err());
+    let mut ssl = client(&config);
+    ssl.set_curves_list("P-256").unwrap();
+    let mut stream = capture(ssl);
+    assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::SSL);
+    assert!(stream.get_ref().wire.is_empty());
+}
+
+fn der(tag: u8, payload: &[u8]) -> Vec<u8> {
+    let mut output = vec![tag];
+    match payload.len() {
+        0..=127 => output.push(payload.len() as u8),
+        128..=255 => output.extend_from_slice(&[0x81, payload.len() as u8]),
+        _ => {
+            output.push(0x82);
+            output.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        }
+    }
+    output.extend_from_slice(payload);
+    output
+}
+
+// Synthetic certificate envelope only. Native BoringSSL still produces and
+// verifies the TLS 1.3 records/transcript; this is not a TLS server decoder.
+fn temporary_certificate(
+    key: &PKey<Private>,
+    auth: &[u8; 32],
+    bad_hmac: bool,
+    large: bool,
+) -> boring::x509::X509 {
+    let algorithm = der(0x30, &[0x06, 0x03, 0x2b, 0x65, 0x70]);
+    let name = der(
+        0x30,
+        &der(
+            0x31,
+            &der(
+                0x30,
+                &[der(6, &[0x55, 4, 3]), der(0x0c, b"reality.test")].concat(),
+            ),
+        ),
+    );
+    let validity = der(
+        0x30,
+        &[der(0x17, b"200101000000Z"), der(0x17, b"491231235959Z")].concat(),
+    );
+    let mut tbs = [
+        der(0xa0, &der(2, &[2])),
+        der(2, &[1]),
+        algorithm.clone(),
+        name.clone(),
+        validity,
+        name,
+        key.public_key_to_der().unwrap(),
+    ]
+    .concat();
+    if large {
+        let extension = der(
+            0x30,
+            &[der(6, &[0x2a, 3, 4]), der(4, &vec![0; 20000])].concat(),
+        );
+        tbs.extend_from_slice(&der(0xa3, &der(0x30, &extension)));
+    }
+    let mut public = [0; 32];
+    let mut hmac = boring::hmac::Hmac::init(auth, &MessageDigest::sha512()).unwrap();
+    hmac.update(key.raw_public_key(&mut public).unwrap())
+        .unwrap();
+    let mut signature = hmac.finalize().unwrap();
+    if bad_hmac {
+        signature[0] ^= 1;
+    }
+    let signature = der(3, &[vec![0], signature].concat());
+    boring::x509::X509::from_der(&der(
+        0x30,
+        &[der(0x30, &tbs), algorithm, signature].concat(),
+    ))
+    .unwrap()
+}
+
+struct BadSignature;
+impl boring::ssl::PrivateKeyMethod for BadSignature {
+    fn sign(
+        &self,
+        _: &mut boring::ssl::SslRef,
+        _: &[u8],
+        _: boring::ssl::SslSignatureAlgorithm,
+        output: &mut [u8],
+    ) -> Result<usize, boring::ssl::PrivateKeyMethodError> {
+        output[..64].fill(0);
+        Ok(64)
+    }
+    fn decrypt(
+        &self,
+        _: &mut boring::ssl::SslRef,
+        _: &[u8],
+        _: &mut [u8],
+    ) -> Result<usize, boring::ssl::PrivateKeyMethodError> {
+        Err(boring::ssl::PrivateKeyMethodError::FAILURE)
+    }
+    fn complete(
+        &self,
+        _: &mut boring::ssl::SslRef,
+        _: &mut [u8],
+    ) -> Result<usize, boring::ssl::PrivateKeyMethodError> {
+        Err(boring::ssl::PrivateKeyMethodError::FAILURE)
+    }
+}
+
+fn memory_handshake(
+    bad_hmac: bool,
+    bad_signature: bool,
+    extra_cert: bool,
+    large: bool,
+) -> Result<(), String> {
+    let (static_key, parameters) = parameters();
+    let mut ssl = client(&parameters);
+    // The unmodified native TLS test server obeys the advertised list, unlike
+    // a REALITY server. Chrome's unchanged list is covered by Mihomo interop.
+    ssl.set_verify_algorithm_prefs(&[boring::ssl::SslSignatureAlgorithm::ED25519])
+        .unwrap();
+    // Deliberately permissive trust policy cannot bypass REALITY authentication.
+    ssl.set_custom_verify_callback(boring::ssl::SslVerifyMode::NONE, |_| Ok(()));
+    let mut client = capture(ssl);
+    assert_eq!(client.connect().unwrap_err().code(), ErrorCode::WANT_READ);
+    let auth = wire_auth_key(&static_key, &hello(&client.get_ref().wire));
+    let cert_key = PKey::generate(Id::ED25519).unwrap();
+    let cert = temporary_certificate(&cert_key, &auth, bad_hmac, large);
+    let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
+    ctx.set_min_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+    ctx.set_max_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+    ctx.set_curves_list("X25519").unwrap();
+    ctx.set_certificate(&cert).unwrap();
+    if extra_cert {
+        ctx.add_extra_chain_cert(cert).unwrap();
+    }
+    ctx.set_private_key(&cert_key).unwrap();
+    if bad_signature {
+        ctx.set_private_key_method(BadSignature);
+    }
+    let mut server = capture(Ssl::new(&ctx.build()).unwrap());
+    let mut client_done = false;
+    let mut server_done = false;
+    for _ in 0..16 {
+        server
+            .get_mut()
+            .incoming
+            .extend(client.get_mut().wire.drain(..));
+        if !server_done {
+            match server.accept() {
+                Ok(()) => server_done = true,
+                Err(error) => assert_eq!(error.code(), ErrorCode::WANT_READ, "fixture: {error}"),
+            }
+        }
+        client
+            .get_mut()
+            .incoming
+            .extend(server.get_mut().wire.drain(..));
+        if !client_done {
+            match client.connect() {
+                Ok(()) => client_done = true,
+                Err(error) if error.code() == ErrorCode::WANT_READ => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        if client_done && server_done {
+            return Ok(());
+        }
+    }
+    panic!("bounded memory handshake failed to progress");
+}
+
+#[test]
+fn real_certificate_verify_is_required_after_hmac_authentication() {
+    memory_handshake(false, false, false, false).unwrap();
+    let error = memory_handshake(false, true, false, false).unwrap_err();
+    assert!(error.contains("BAD_SIGNATURE"), "{error}");
+}
+
+#[test]
+fn certificate_hmac_chain_and_size_cannot_be_bypassed() {
+    for (bad_hmac, extra, large) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let error = memory_handshake(bad_hmac, false, extra, large).unwrap_err();
+        assert!(error.contains("CERTIFICATE_VERIFY_FAILED"), "{error}");
+    }
+}
