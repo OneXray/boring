@@ -19,7 +19,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = []
 reality = ["boring-sys/reality"]
-client-fingerprint = ["dep:brotli", "boring-sys/client-fingerprint"]
+client-fingerprint = ["dep:brotli", "dep:flate2", "boring-sys/client-fingerprint"]
 
 # Use a FIPS-validated version of BoringSSL.
 fips = ["boring-sys/fips"]
@@ -66,6 +66,7 @@ fips-precompiled = ["fips"]
 
 [dependencies]
 brotli = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
 bitflags = { workspace = true }
 foreign-types = { workspace = true }
 openssl-macros = { workspace = true }

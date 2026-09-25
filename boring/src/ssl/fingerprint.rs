@@ -18,6 +18,10 @@ pub enum ClientFingerprint {
     /// Chrome 133 with native X25519MLKEM768 + X25519 shares and new h2 ALPS.
     /// This is ordinary stream TLS, not PQ REALITY or QUIC impersonation.
     Chrome133,
+    /// Firefox 120, with X25519/P-256 shares and its fixed extension order.
+    Firefox120,
+    /// Safari 16.0's stream profile. The caller still owns the TLS version floor.
+    Safari16,
 }
 
 // A closed, bounded catalog, not user-supplied extension/cipher data. The native
@@ -34,7 +38,13 @@ struct Profile {
     sct: bool,
     ech_grease: bool,
     alps_new_codepoint: Option<bool>,
-    brotli: bool,
+    compression: Compression,
+}
+
+enum Compression {
+    None,
+    Brotli,
+    Zlib,
 }
 
 impl ClientFingerprint {
@@ -42,6 +52,8 @@ impl ClientFingerprint {
         match self {
             Self::Chrome120 => &CHROME120,
             Self::Chrome133 => &CHROME133,
+            Self::Firefox120 => &FIREFOX120,
+            Self::Safari16 => &SAFARI16,
         }
     }
 }
@@ -67,7 +79,7 @@ const CHROME120: Profile = Profile {
     sct: true,
     ech_grease: true,
     alps_new_codepoint: Some(false),
-    brotli: true,
+    compression: Compression::Brotli,
 };
 
 const CHROME133: Profile = Profile {
@@ -76,6 +88,57 @@ const CHROME133: Profile = Profile {
     key_shares: &[4588, 29],
     alps_new_codepoint: Some(true),
     ..CHROME120
+};
+
+const FIREFOX120: Profile = Profile {
+    native_id: 3,
+    ciphers: concat!(
+        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:",
+        "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:",
+        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:",
+        "ECDHE-ECDSA-AES256-SHA:ECDHE-ECDSA-AES128-SHA:",
+        "ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:",
+        "AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA"
+    ),
+    groups: &[29, 23, 24, 25],
+    key_shares: &[29, 23],
+    signatures: concat!(
+        "ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384:ecdsa_secp521r1_sha512:",
+        "rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:",
+        "rsa_pkcs1_sha256:rsa_pkcs1_sha384:rsa_pkcs1_sha512:ecdsa_sha1:rsa_pkcs1_sha1"
+    ),
+    grease: false,
+    shuffle: false,
+    sct: false,
+    ech_grease: true,
+    alps_new_codepoint: None,
+    compression: Compression::None,
+};
+
+const SAFARI16: Profile = Profile {
+    native_id: 4,
+    ciphers: concat!(
+        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:",
+        "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-AES256-GCM-SHA384:",
+        "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-CHACHA20-POLY1305:",
+        "ECDHE-ECDSA-AES256-SHA:ECDHE-ECDSA-AES128-SHA:",
+        "ECDHE-RSA-AES256-SHA:ECDHE-RSA-AES128-SHA:",
+        "AES256-GCM-SHA384:AES128-GCM-SHA256:AES256-SHA:AES128-SHA:",
+        "ECDHE-RSA-DES-CBC3-SHA:DES-CBC3-SHA"
+    ),
+    groups: &[29, 23, 24, 25],
+    key_shares: &[29],
+    signatures: concat!(
+        "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:",
+        "ecdsa_secp384r1_sha384:ecdsa_sha1:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:",
+        "rsa_pss_rsae_sha512:rsa_pkcs1_sha512:rsa_pkcs1_sha1"
+    ),
+    grease: true,
+    shuffle: false,
+    sct: true,
+    ech_grease: false,
+    alps_new_codepoint: None,
+    compression: Compression::Zlib,
 };
 
 /// Immutable profile plus caller-configured TLS trust, versions and identity.
@@ -103,8 +166,10 @@ impl FingerprintConnector {
             builder.enable_signed_cert_timestamps();
         }
         builder.enable_ocsp_stapling();
-        if spec.brotli {
-            builder.add_certificate_compression_algorithm(Brotli)?;
+        match spec.compression {
+            Compression::None => {}
+            Compression::Brotli => builder.add_certificate_compression_algorithm(Brotli)?,
+            Compression::Zlib => builder.add_certificate_compression_algorithm(Zlib)?,
         }
         // These setters copy bounded static values; native code validates IDs.
         unsafe {
@@ -193,6 +258,33 @@ impl SslRef {
 }
 
 const MAX_CERTIFICATE_BYTES: usize = 128 * 1024;
+
+struct Zlib;
+impl CertificateCompressor for Zlib {
+    const ALGORITHM: CertificateCompressionAlgorithm = CertificateCompressionAlgorithm::ZLIB;
+    const CAN_COMPRESS: bool = false;
+    const CAN_DECOMPRESS: bool = true;
+    fn decompress<W: Write>(&self, input: &[u8], output: &mut W) -> io::Result<()> {
+        if input.len() > MAX_CERTIFICATE_BYTES {
+            return Err(io::Error::other("compressed certificate limit"));
+        }
+        // Fixed bound, independent of the untrusted declared size. Require a
+        // complete, checksummed stream and reject trailing concatenated data.
+        let mut buffer = vec![0; MAX_CERTIFICATE_BYTES + 1];
+        let mut decoder = flate2::Decompress::new(true);
+        let status = decoder.decompress(input, &mut buffer, flate2::FlushDecompress::Finish)?;
+        if status != flate2::Status::StreamEnd
+            || decoder.total_in() != input.len() as u64
+            || decoder.total_out() > MAX_CERTIFICATE_BYTES as u64
+        {
+            return Err(io::Error::other(
+                "invalid or oversized certificate compression",
+            ));
+        }
+        output.write_all(&buffer[..decoder.total_out() as usize])
+    }
+}
+
 struct Brotli;
 impl CertificateCompressor for Brotli {
     const ALGORITHM: CertificateCompressionAlgorithm = CertificateCompressionAlgorithm::BROTLI;

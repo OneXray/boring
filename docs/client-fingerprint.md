@@ -1,10 +1,11 @@
 # Named ClientHello profiles
 
 Enable `boring/client-fingerprint` or `tokio-boring/client-fingerprint` on this
-fork. The implemented profiles are `ClientFingerprint::Chrome120` (classic
-X25519) and `ClientFingerprint::Chrome133` (ordinary TLS with native
-X25519MLKEM768 and X25519 shares, new ALPS and no padding). Both are fixed
-templates, not aliases following a browser release automatically. Unknown profile names
+fork. The implemented fixed profiles are `ClientFingerprint::Chrome120` (classic
+X25519), `Chrome133` (ordinary TLS with native X25519MLKEM768 and X25519 shares,
+new ALPS and no padding), `Firefox120` (X25519/P-256 shares and fixed order) and
+`Safari16` (Safari 16.0, fixed order and Zlib). They are not aliases following a
+browser release automatically. Unknown profile names
 must be rejected by applications; this library does not silently map them to a
 different browser.
 
@@ -37,7 +38,8 @@ Restricting TLS versions or ALPN intentionally changes the resulting wire shape.
 
 The profile configures ciphers, supported groups, signature algorithms, GREASE,
 extension permutation, SCT/OCSP, ECH GREASE and template-specific h2 ALPS. Certificate
-compression is real Brotli decompression, not an advertised-only extension. The
+compression uses real Brotli for Chrome and Zlib for Safari; Firefox does not
+advertise it. This is not an advertised-only extension. The
 native certificate-message allocation and decoder output are bounded to 128 KiB.
 The profile does not disable certificate verification, weaken handshake signature
 verification, enable early data or create a resumption policy.
@@ -56,8 +58,9 @@ exception and native CertificateVerify checks remain in the native handshake.
 The full connection-local invariants and deliberately unsupported combinations
 are documented in [REALITY](reality-client.md).
 
-CF2 validates Chrome133 only for ordinary TLS. Its classic REALITY shape and
-authentication integration remain CF4 work; ordinary-TLS ML-KEM is not PQ REALITY.
+CF2/CF3 validate the additional profiles only for ordinary TLS. Their classic
+REALITY shape and authentication integration remain CF4 work; ordinary-TLS
+ML-KEM is not PQ REALITY.
 
 ## Scope and verification
 
@@ -71,8 +74,23 @@ never arbitrary extension bytes. Stream-client configuration is checked before
 IO; DTLS, QUIC, already-started or repeated native selection fails. FIPS, RPK and
 external/precompiled BoringSSL are rejected at build time. Profiles share one
 bounded internal catalog for cipher/signature lists, ordered groups and separate
-key shares, permutation, ECH, ALPS codepoint and compression. Firefox and Safari
-are not implemented yet; this is not four-template completion.
+key shares, permutation, ECH, ALPS codepoint and compression.
+
+Firefox's FFDHE groups, delegated-credential and record-size-limit declarations
+are template-only, as in the source uTLS template, not new RFC implementations.
+Selection of an unavailable group or a ServerHello response to these extensions
+fails closed. Safari's 0xc008 cipher is likewise template-only in uTLS and is
+rejected if selected. Its real 0xc012 ECDHE-RSA-3DES suite reuses native primitives
+and is deprecated/default-off outside explicit cipher configuration. No RC4 was
+restored. Safari's repeated signature scheme is a wire encoding detail; real
+signature verification preferences remain unique.
+
+Applications must set their TLS version floor (VCore uses TLS1.2), which trims
+Safari's reference TLS1.0/1.1 advertisement. Safari omits the cold session-ticket
+extension. Actual caller-supplied TLS1.2 tickets can still use it; warm connections
+are not claimed as identical to the reference cold template. Zlib rejects
+truncation, corrupt checksums, trailing bytes and oversized output before passing
+the certificate to the unchanged verifier.
 
 TLS1.3 cipher order and Chrome ECH GREASE AEAD are fixed by the named template,
 not CPU AES acceleration. Real native cipher filtering, key generation,
@@ -82,8 +100,8 @@ introduced; the unconfigured native path is unchanged.
 Targeted checks create only memory streams, including real native TLS peers:
 
 ```sh
-cargo test -p boring --features reality,client-fingerprint --test client_fingerprint --test reality --test hkdf
-cargo test -p tokio-boring --features reality,client-fingerprint --test client_fingerprint
+cargo test -p boring --features reality,client-fingerprint --test client_fingerprint --test selected_fingerprint --test reality --test hkdf
+cargo test -p tokio-boring --features reality,client-fingerprint --test client_fingerprint --test selected_fingerprint
 cargo clippy -p boring -p tokio-boring --features reality,client-fingerprint --lib -- -D warnings
 cargo fmt --all -- --check
 ```

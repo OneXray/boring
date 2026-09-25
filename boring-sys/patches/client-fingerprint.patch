@@ -1,56 +1,48 @@
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index 055b3e02..96b307f9 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -5512,8 +5512,13 @@
+@@ -5512,6 +5512,13 @@ OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
  
--// SSL_max_seal_overhead returns the maximum overhead, in bytes, of sealing a
--// record with |ssl|.
 +// Opt-in named profile encoding from this fork. Only built-in, implemented
-+// profile IDs are accepted (1 = Chrome120, 2 = Chrome133). Trust and sessions
++// profile IDs are accepted (1 = Chrome120, 2 = Chrome133, 3 = Firefox120,
++// 4 = Safari16).
++// Trust, versions, ALPN and sessions
 +// remain caller-owned. Fresh stream clients only; no raw ClientHello API.
 +OPENSSL_EXPORT int SSL_set_client_fingerprint(SSL *ssl, unsigned profile);
 +
-+// SSL_max_seal_overhead returns the maximum overhead, in bytes, of sealing a
-+// record with |ssl|.
+ // SSL_max_seal_overhead returns the maximum overhead, in bytes, of sealing a
+ // record with |ssl|.
  OPENSSL_EXPORT size_t SSL_max_seal_overhead(const SSL *ssl);
- 
- // SSL_CTX_set_false_start_allowed_without_alpn configures whether connections
 diff --git a/ssl/internal.h b/ssl/internal.h
+index 2bea8f62..c97af5bf 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
-@@ -3366,9 +3366,12 @@
-   // and is further constrained by |SSL_OP_NO_*|.
-   uint16_t conf_min_version = 0;
+@@ -3368,6 +3368,9 @@ struct SSL_CONFIG {
  
--  X509_VERIFY_PARAM *param = nullptr;
--
--  // crypto
-+  X509_VERIFY_PARAM *param = nullptr;
-+
+   X509_VERIFY_PARAM *param = nullptr;
+ 
 +  // A closed profile ID; zero preserves the unmodified native encoding.
 +  uint8_t client_fingerprint = 0;
 +
-+  // crypto
+   // crypto
    UniquePtr<SSLCipherPreferenceList> cipher_list;
  
-   // This is used to hold the local certificate used (i.e. the server
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+index 89702eaa..8dbfd49e 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
-@@ -3163,9 +3163,21 @@
+@@ -3163,6 +3163,18 @@ void SSL_set_permute_extensions(SSL *ssl, int enabled) {
    ssl->config->permute_extensions = !!enabled;
  }
  
--int32_t SSL_get_ticket_age_skew(const SSL *ssl) {
--  return ssl->s3->ticket_age_skew;
--}
 +int SSL_set_client_fingerprint(SSL *ssl, unsigned profile) {
 +  if (!ssl || !ssl->config || ssl->server || SSL_is_dtls(ssl) || SSL_is_quic(ssl) ||
 +      ssl->s3->initial_handshake_complete ||
 +      (ssl->s3->hs != nullptr && ssl->s3->hs->max_version != 0) ||
-+      ssl->config->client_fingerprint != 0 || profile < 1 || profile > 2) {
++      ssl->config->client_fingerprint != 0 || profile < 1 || profile > 4) {
 +    OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
 +    return 0;
 +  }
@@ -58,61 +50,249 @@ diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
 +  return 1;
 +}
 +
-+int32_t SSL_get_ticket_age_skew(const SSL *ssl) {
-+  return ssl->s3->ticket_age_skew;
-+}
- 
- void SSL_CTX_set_false_start_allowed_without_alpn(SSL_CTX *ctx, int allowed) {
-   ctx->false_start_allowed_without_alpn = !!allowed;
+ int32_t SSL_get_ticket_age_skew(const SSL *ssl) {
+   return ssl->s3->ticket_age_skew;
+ }
 diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
+index 7ab6d2c5..9908aacc 100644
 --- a/ssl/handshake_client.cc
 +++ b/ssl/handshake_client.cc
-@@ -127,9 +127,12 @@
+@@ -126,12 +126,22 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+         SSL_CIPHER_AES_128_GCM_SHA256,
          SSL_CIPHER_CHACHA20_POLY1305_SHA256,
      };
++    static const uint16_t kCiphersFirefox[] = {
++        SSL_CIPHER_AES_128_GCM_SHA256,
++        SSL_CIPHER_CHACHA20_POLY1305_SHA256,
++        SSL_CIPHER_AES_256_GCM_SHA384,
++    };
  
 -    const bool has_aes_hw = ssl->config->aes_hw_override
--                                ? ssl->config->aes_hw_override_value
--                                : EVP_has_aes_hardware();
 +    // The named template has a fixed TLS 1.3 order on every CPU. This only
 +    // controls advertising order; the native policy still filters each cipher.
 +    const bool has_aes_hw = ssl->config->client_fingerprint != 0 ||
 +                           (ssl->config->aes_hw_override
-+                                ? ssl->config->aes_hw_override_value
+                                 ? ssl->config->aes_hw_override_value
+-                                : EVP_has_aes_hardware();
 +                                : EVP_has_aes_hardware());
      const bssl::Span<const uint16_t> ciphers =
-         ssl->config->compliance_policy == ssl_compliance_policy_cnsa_202407
+-        ssl->config->compliance_policy == ssl_compliance_policy_cnsa_202407
++        ssl->config->client_fingerprint == 3
++            ? bssl::Span<const uint16_t>(kCiphersFirefox)
++            : ssl->config->compliance_policy == ssl_compliance_policy_cnsa_202407
              ? bssl::Span<const uint16_t>(kCiphersCNSA)
+             : (has_aes_hw ? bssl::Span<const uint16_t>(kCiphersAESHardware)
+                           : bssl::Span<const uint16_t>(kCiphersNoAESHardware));
+@@ -157,6 +167,13 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+         continue;
+       }
+       any_enabled = true;
++      // uTLS Safari declares unsupported ECDHE-ECDSA-3DES (0xc008). It is
++      // deliberately absent from the native cipher table, so selection fails.
++      if (hs->config->client_fingerprint == 4 &&
++          SSL_CIPHER_get_protocol_id(cipher) == 0xc012 &&
++          !CBB_add_u16(&child, 0xc008)) {
++        return false;
++      }
+       if (!CBB_add_u16(&child, SSL_CIPHER_get_protocol_id(cipher))) {
+         return false;
+       }
 diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
+index e288f3cf..8b50abcf 100644
 --- a/ssl/encrypted_client_hello.cc
 +++ b/ssl/encrypted_client_hello.cc
-@@ -736,9 +736,11 @@
+@@ -736,9 +736,13 @@ static bool setup_ech_grease(SSL_HANDSHAKE *hs) {
    }
  
    const uint16_t kdf_id = EVP_HPKE_HKDF_SHA256;
 -  const bool has_aes_hw = hs->ssl->config->aes_hw_override
--                              ? hs->ssl->config->aes_hw_override_value
--                              : EVP_has_aes_hardware();
 +  // Chrome's GREASE shape is fixed by its template, not the local CPU.
-+  const bool has_aes_hw = hs->config->client_fingerprint != 0 ||
++  const bool has_aes_hw = hs->config->client_fingerprint == 3
++      ? random_size(0, 1) != 0
++      : hs->config->client_fingerprint != 0 ||
 +                         (hs->ssl->config->aes_hw_override
-+                              ? hs->ssl->config->aes_hw_override_value
+                               ? hs->ssl->config->aes_hw_override_value
+-                              : EVP_has_aes_hardware();
 +                              : EVP_has_aes_hardware());
    const EVP_HPKE_AEAD *aead =
        has_aes_hw ? EVP_hpke_aes_128_gcm() : EVP_hpke_chacha20_poly1305();
    static_assert(ssl_grease_ech_config_id < sizeof(hs->grease_seed),
+@@ -765,7 +769,8 @@ static bool setup_ech_grease(SSL_HANDSHAKE *hs) {
+   // estimate maximum_name_length to be between 32 and 100 bytes. Then round up
+   // to a multiple of 32, to match RFC 9849, section 6.1.3.
+   const size_t payload_len =
+-      32 * random_size(128 / 32, 224 / 32) + aead_overhead(aead);
++      (hs->config->client_fingerprint == 3
++           ? 223 : 32 * random_size(128 / 32, 224 / 32)) + aead_overhead(aead);
+   bssl::ScopedCBB cbb;
+   CBB enc_cbb, payload_cbb;
+   uint8_t *payload;
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
+index db1a2913..df375ff7 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
-@@ -4520,8 +4520,9 @@
-   // bugs. We also apply this padding to ClientHelloOuter, to keep the wire
+@@ -348,6 +348,12 @@ bool tls12_add_verify_sigalgs(const SSL_HANDSHAKE *hs, CBB *out) {
+     if (!CBB_add_u16(out, sigalg)) {
+       return false;
+     }
++    // Safari repeats this signature scheme. Keep real verification preferences
++    // unique and preserve the duplicate only in the final transcript encoding.
++    if (hs->config->client_fingerprint == 4 && sigalg == 0x0805 &&
++        !CBB_add_u16(out, sigalg)) {
++      return false;
++    }
+   }
+   return true;
+ }
+@@ -941,6 +947,13 @@ static bool ext_ticket_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
+       SSL_get_options(ssl) & SSL_OP_NO_TICKET) {
+     return true;
+   }
++  // Safari's cold template omits this extension. A caller's actual TLS1.2
++  // ticket may still be offered; warm policy is intentionally caller-owned.
++  if (hs->config->client_fingerprint == 4 &&
++      (ssl->session == nullptr ||
++       ssl_session_get_type(ssl->session.get()) != SSLSessionType::kTicket)) {
++    return true;
++  }
+ 
+   // Renegotiation does not participate in session resumption. However, still
+   // advertise the extension to avoid potentially breaking servers which carry
+@@ -2726,6 +2739,12 @@ static bool ext_supported_groups_add_clienthello(const SSL_HANDSHAKE *hs,
+     }
+   }
+ 
++  // uTLS Firefox declares FFDHE but does not implement it. Do not put these
++  // IDs in the real supported-group/key-share list: selection must fail closed.
++  if (hs->config->client_fingerprint == 3 &&
++      (!CBB_add_u16(&groups_bytes, 256) || !CBB_add_u16(&groups_bytes, 257))) {
++    return false;
++  }
+   return CBB_flush(out_compressible);
+ }
+ 
+@@ -3257,6 +3276,12 @@ static bool ext_quic_transport_params_add_serverhello_legacy(SSL_HANDSHAKE *hs,
+ static bool ext_delegated_credential_add_clienthello(
+     const SSL_HANDSHAKE *hs, CBB *out, CBB *out_compressible,
+     ssl_client_hello_type_t type) {
++  if (hs->config->client_fingerprint == 3) {
++    // Fixed template-only declaration, not delegated credential verification.
++    static const uint8_t kDeclaration[] = {
++        0, 34, 0, 10, 0, 8, 4, 3, 5, 3, 6, 3, 2, 3};
++    return CBB_add_bytes(out, kDeclaration, sizeof(kDeclaration));
++  }
+   return true;
+ }
+ 
+@@ -4056,8 +4081,27 @@ static bool ext_server_cert_type_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
+   return true;
+ }
+ 
++static bool ext_profile_record_limit_add_clienthello(
++    const SSL_HANDSHAKE *hs, CBB *out, CBB *out_compressible,
++    ssl_client_hello_type_t type) {
++  if (hs->config->client_fingerprint != 3) {
++    return true;
++  }
++  // uTLS's FakeRecordSizeLimitExtension. A response is explicitly rejected;
++  // do not claim a negotiated RFC 8449 send limit which we do not implement.
++  static const uint8_t kDeclaration[] = {0, 28, 0, 2, 0x40, 1};
++  return CBB_add_bytes(out, kDeclaration, sizeof(kDeclaration));
++}
++
+ // kExtensions contains all the supported extensions.
+ static const struct tls_extension kExtensions[] = {
++    {
++        28,
++        ext_profile_record_limit_add_clienthello,
++        forbid_parse_serverhello,
++        ignore_parse_clienthello,
++        dont_add_serverhello,
++    },
+     {
+         TLSEXT_TYPE_server_name,
+         ext_sni_add_clienthello,
+@@ -4297,6 +4341,43 @@ static_assert(kNumExtensions <=
+               "too many extensions for received bitset");
+ 
+ bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs) {
++  if (hs->config->client_fingerprint == 3 || hs->config->client_fingerprint == 4) {
++    static const uint16_t kFirefox[] = {
++        0, 23, 65281, 10, 11, 35, 16, 5, 34, 51, 43, 13, 45, 28, 65037};
++    static const uint16_t kSafari[] = {
++        0, 23, 65281, 10, 11, 16, 5, 13, 18, 51, 45, 43, 27};
++    Array<uint8_t> permutation;
++    if (!permutation.InitForOverwrite(kNumExtensions)) {
++      return false;
++    }
++    bool used[kNumExtensions] = {};
++    size_t at = 0;
++    auto order = hs->config->client_fingerprint == 3
++        ? Span<const uint16_t>(kFirefox) : Span<const uint16_t>(kSafari);
++    for (uint16_t id : order) {
++      bool found = false;
++      for (size_t i = 0; i < kNumExtensions; i++) {
++        if (kExtensions[i].value == id) {
++          permutation[at++] = i;
++          used[i] = true;
++          found = true;
++          break;
++        }
++      }
++      if (!found) {
++        OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++        return false;
++      }
++    }
++    // Native conditional fields, such as the HRR cookie, retain real handling.
++    for (size_t i = 0; i < kNumExtensions; i++) {
++      if (!used[i]) {
++        permutation[at++] = i;
++      }
++    }
++    hs->extension_permutation = std::move(permutation);
++    return true;
++  }
+   if (!hs->config->permute_extensions) {
+     return true;
+   }
+@@ -4521,6 +4602,7 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
    // images aligned.
    size_t psk_len = ext_pre_shared_key_clienthello_length(hs, type);
--  if (!SSL_is_dtls(ssl) && !SSL_is_quic(ssl) &&
--      !ssl->s3->used_hello_retry_request) {
-+  if (!SSL_is_dtls(ssl) && !SSL_is_quic(ssl) &&
-+      hs->config->client_fingerprint != 2 &&
-+      !ssl->s3->used_hello_retry_request) {
+   if (!SSL_is_dtls(ssl) && !SSL_is_quic(ssl) &&
++      hs->config->client_fingerprint != 2 && hs->config->client_fingerprint != 3 &&
+       !ssl->s3->used_hello_retry_request) {
      msg_len += 2 /* length prefix */ + CBB_len(&extensions) + psk_len;
      // The length of the padding extension, excluding the four-byte extension
-     // header.
+diff --git a/ssl/ssl_cipher.cc b/ssl/ssl_cipher.cc
+index 1ef231c3..d5435efe 100644
+--- a/ssl/ssl_cipher.cc
++++ b/ssl/ssl_cipher.cc
+@@ -189,6 +189,19 @@ static constexpr SSL_CIPHER kCiphers[] = {
+         SSL_HANDSHAKE_MAC_DEFAULT,
+     },
+ 
++    // Opt-in profile patch: reuse native ECDHE/RSA and 3DES primitives for
++    // Safari's real, selectable legacy suite. Deprecated/default-off as 3DES.
++    {
++        "ECDHE-RSA-DES-CBC3-SHA",
++        "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA",
++        0xc012,
++        SSL_kECDHE,
++        SSL_aRSA_SIGN,
++        SSL_3DES,
++        SSL_SHA1,
++        SSL_HANDSHAKE_MAC_DEFAULT,
++    },
++
+     // Cipher C013
+     {
+         TLS1_TXT_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+@@ -1046,6 +1059,7 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
+       SSL_CIPHER_RSA_WITH_AES_256_CBC_SHA,
+       SSL_CIPHER_PSK_WITH_AES_256_CBC_SHA,
+       SSL_CIPHER_RSA_WITH_3DES_EDE_CBC_SHA,
++      0xc012,
+   };
+ 
+   // Set up a linked list of ciphers.
