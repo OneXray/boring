@@ -593,6 +593,51 @@ enum ServerHelloFault {
     Extension(u16),
 }
 
+#[cfg(feature = "reality")]
+#[tokio::test]
+async fn all_classic_reality_profiles_reject_hrr_and_tls12() {
+    use boring::ssl::RealityClientConfig;
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        for profile in [
+            ClientFingerprint::Chrome120,
+            ClientFingerprint::Chrome133,
+            ClientFingerprint::Firefox120,
+            ClientFingerprint::Safari16,
+        ] {
+            for (version, group, expected) in [
+                (SslVersion::TLS1_2, "X25519", "UNSUPPORTED_PROTOCOL"),
+                (SslVersion::TLS1_3, "P-384", "UNEXPECTED_MESSAGE"),
+            ] {
+                let (io, remote) = tokio::io::duplex(4096);
+                let peer = tokio::spawn(async move {
+                    tokio_boring::accept(&server(version, group).build(), remote)
+                        .await
+                        .is_err()
+                });
+                let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+                builder
+                    .set_min_proto_version(Some(SslVersion::TLS1_2))
+                    .unwrap();
+                builder.set_custom_verify_callback(SslVerifyMode::NONE, |_| Ok(()));
+                let connector = FingerprintConnector::new(builder, profile).unwrap();
+                let mut config = connector.configure(b"\x02h2").unwrap();
+                config
+                    .set_reality_client(&RealityClientConfig::new([9; 32], &[], [1, 8, 0]).unwrap())
+                    .unwrap();
+                config.set_verify_hostname(false);
+                let error = tokio_boring::connect(config, "profile.test", io)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains(expected), "{profile:?}: {error}");
+                drop(error);
+                assert!(peer.await.unwrap());
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
 async fn reject_server_hello(
     profile: ClientFingerprint,
     version: SslVersion,

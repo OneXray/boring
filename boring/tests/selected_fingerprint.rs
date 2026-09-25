@@ -41,17 +41,41 @@ fn grease(id: u16) -> bool {
     id & 0x0f0f == 0x0a0a && id >> 8 == id & 0xff
 }
 
-#[test]
-fn firefox120_has_independent_fixed_order_and_two_classic_shares() {
+fn configuration(
+    connector: &FingerprintConnector,
+    reality: bool,
+) -> boring::ssl::ConnectConfiguration {
+    let config = connector.configure(b"\x02h2\x08http/1.1").unwrap();
+    #[cfg(feature = "reality")]
+    let config = {
+        let mut config = config;
+        if reality {
+            use boring::{
+                pkey::{Id, PKey},
+                ssl::RealityClientConfig,
+            };
+            let peer = PKey::generate(Id::X25519).unwrap();
+            let mut public = [0; 32];
+            peer.raw_public_key(&mut public).unwrap();
+            config
+                .set_reality_client(&RealityClientConfig::new(public, &[], [1, 8, 0]).unwrap())
+                .unwrap();
+        }
+        config
+    };
+    #[cfg(not(feature = "reality"))]
+    assert!(!reality);
+    config
+}
+
+fn check_firefox(reality: bool) {
     let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
     builder
         .set_min_proto_version(Some(SslVersion::TLS1_2))
         .unwrap();
     let connector = FingerprintConnector::new(builder, ClientFingerprint::Firefox120).unwrap();
     for _ in 0..8 {
-        let error = connector
-            .configure(b"\x02h2\x08http/1.1")
-            .unwrap()
+        let error = configuration(&connector, reality)
             .connect("fingerprint.test", Capture::default())
             .unwrap_err();
         let boring::ssl::HandshakeError::WouldBlock(stream) = error else {
@@ -131,17 +155,14 @@ fn firefox120_has_independent_fixed_order_and_two_classic_shares() {
     }
 }
 
-#[test]
-fn safari16_preserves_fixed_cipher_signature_and_extension_vectors() {
+fn check_safari(reality: bool) {
     let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
     builder
         .set_min_proto_version(Some(SslVersion::TLS1_2))
         .unwrap();
     let connector = FingerprintConnector::new(builder, ClientFingerprint::Safari16).unwrap();
     for _ in 0..8 {
-        let error = connector
-            .configure(b"\x02h2\x08http/1.1")
-            .unwrap()
+        let error = configuration(&connector, reality)
             .connect("fingerprint.test", Capture::default())
             .unwrap_err();
         let boring::ssl::HandshakeError::WouldBlock(stream) = error else {
@@ -222,8 +243,7 @@ fn safari16_preserves_fixed_cipher_signature_and_extension_vectors() {
     }
 }
 
-#[test]
-fn chrome133_has_real_mlkem_shares_new_alps_and_no_padding() {
+fn check_chrome133(reality: bool) {
     // Independent expected fields: CF0 official Mihomo v1.19.31 / uTLS v1.8.7
     // Chrome133, not data loaded from the implementation's profile table.
     let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
@@ -236,9 +256,7 @@ fn chrome133_has_real_mlkem_shares_new_alps_and_no_padding() {
         format!("{}.fingerprint.test", "f".repeat(63)),
     ] {
         for _ in 0..8 {
-            let error = connector
-                .configure(b"\x02h2\x08http/1.1")
-                .unwrap()
+            let error = configuration(&connector, reality)
                 .connect(&sni, Capture::default())
                 .unwrap_err();
             let boring::ssl::HandshakeError::WouldBlock(stream) = error else {
@@ -303,11 +321,21 @@ fn chrome133_has_real_mlkem_shares_new_alps_and_no_padding() {
             }
             let groups = codes(&value(10)[2..]);
             assert!(grease(groups[0]));
-            assert_eq!(&groups[1..], &[4588, 29, 23, 24]);
+            assert_eq!(
+                &groups[1..],
+                if reality {
+                    &[29, 23, 24][..]
+                } else {
+                    &[4588, 29, 23, 24][..]
+                }
+            );
             let mut encoded_shares = value(51);
             let mut shares = vector(&mut encoded_shares, 2);
             assert!(encoded_shares.is_empty());
             for (id, size) in [(groups[0], 1), (4588, 1216), (29, 32)] {
+                if reality && id == 4588 {
+                    continue;
+                }
                 assert_eq!(codes(take(&mut shares, 2)), [id]);
                 let key = vector(&mut shares, 2);
                 assert_eq!(key.len(), size);
@@ -330,4 +358,27 @@ fn chrome133_has_real_mlkem_shares_new_alps_and_no_padding() {
             assert_eq!(ech.len(), 42 + size);
         }
     }
+}
+
+#[test]
+fn firefox120_has_independent_fixed_order_and_two_classic_shares() {
+    check_firefox(false);
+}
+
+#[test]
+fn safari16_preserves_fixed_cipher_signature_and_extension_vectors() {
+    check_safari(false);
+}
+
+#[test]
+fn chrome133_has_real_mlkem_shares_new_alps_and_no_padding() {
+    check_chrome133(false);
+}
+
+#[cfg(feature = "reality")]
+#[test]
+fn classic_reality_preserves_each_new_profile_except_required_mlkem_removal() {
+    check_chrome133(true);
+    check_firefox(true);
+    check_safari(true);
 }

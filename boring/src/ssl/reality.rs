@@ -8,7 +8,8 @@ use crate::{cvt, ffi};
 
 /// Immutable classic REALITY client parameters, reusable across connections.
 ///
-/// This experimental feature supports a single X25519 share over TCP/TLS 1.3.
+/// This feature authenticates with the real X25519 share over TCP/TLS 1.3,
+/// preserving additional classic shares from the selected ClientHello profile.
 /// It does not provide browser profiles, name resolution, dialing or fallback.
 /// Each fresh `Ssl` gets its own native, one-use authentication state.
 #[derive(Clone)]
@@ -46,9 +47,10 @@ impl RealityClientConfig {
 impl SslRef {
     /// Enables classic REALITY on a fresh client connection exactly once.
     ///
-    /// Configure supported groups before calling: this selects one X25519 key
-    /// share while preserving the advertised group list. Configure SNI and any
-    /// browser profile separately. Negotiating TLS < 1.3, HRR, actual ECH, QUIC,
+    /// Configure supported groups and any profile before calling. Classic mode
+    /// removes X25519MLKEM768 from groups/shares, preserves other classic shares
+    /// and requires X25519 for authentication. Without explicit shares it selects
+    /// X25519 alone. Configure SNI separately. Negotiating TLS < 1.3, HRR, actual ECH, QUIC,
     /// DTLS, server mode, resumption and early data are rejected. ECH GREASE is
     /// permitted. Invalid configurations may fail here or during handshake.
     ///

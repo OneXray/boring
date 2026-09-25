@@ -33,15 +33,22 @@ correct HMAC-SHA512 signature. Its CertificateVerify must pass native Ed25519
 verification. This narrow authenticated exception does not add Ed25519 to the
 browser's wire signature list or relax ordinary TLS signature policy.
 
-The first slice is classic X25519 over TCP/TLS 1.3 only. The wire may advertise
+The implementation is classic X25519 authentication over TCP/TLS 1.3 only. The wire may advertise
 TLS 1.2 to match a browser, but negotiation below TLS 1.3 fails closed. Actual
-ECH, QUIC, DTLS, HRR, resumption, early data, server mode and non-X25519 shares
-are rejected. ECH GREASE is distinct and remains usable. FIPS, RPK and external
+ECH, QUIC, DTLS, HRR, resumption, early data, server mode and PQ shares are
+rejected. ECH GREASE is distinct and remains usable. FIPS, RPK and external
 precompiled/native-source combinations are outside this slice.
 
 The opt-in [named ClientHello profile](client-fingerprint.md) can be combined
 with this interface. Authentication still owns the same native key share and
 final ClientHello bytes; the profile cannot bypass the REALITY verifier.
+
+With the selected-v1 templates, classic mode removes X25519MLKEM768 from both
+advertised groups and actual shares, matching Mihomo's default classic behavior.
+It preserves other classic shares (including Firefox120's P-256) in order and
+binds authentication to the actual X25519 object, even if it is not first. Without
+explicit share configuration it selects X25519 alone. It creates no second
+identity key or global secret mapping; ordinary Chrome133 TLS still uses ML-KEM.
 
 Auth state is connection-local, one-use and cleansed on authentication, native
 state-machine failure or handshake-state destruction. A transport I/O failure
@@ -66,7 +73,7 @@ All socket servers, including negative fixtures, must be containerized. Pure
 memory tests create no host listener. Upstream network tests are not run on the
 host merely because they are called unit tests.
 
-## Local result — 2026-09-25
+## Historical initial-slice result — 2026-09-25
 
 This **classic REALITY feasibility slice passes locally**, not the complete
 fingerprint rollout. Branch: `feat/reality-client-hello`; fork base:
@@ -124,3 +131,7 @@ review remain application/release gates. Earlier cross-builds are historical
 evidence and do not cover every later code change.
 Actual ECH, QUIC, PQ REALITY and resumption are deliberately unsupported here.
 No VCore production dependency change, commit, push or release is implied.
+
+The later [selected-v1 CF4 fork checks](client-fingerprint-cf4-fork.md) cover the
+new four-template binding. The historical container/device counts above are not
+reused as acceptance for that change.

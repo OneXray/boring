@@ -178,16 +178,99 @@ fn hello_authenticates_wire_key_share_and_final_aad() {
 fn named_profile_preserves_reality_wire_authentication() {
     use boring::ssl::{ClientFingerprint, FingerprintConnector, SslConnector};
     let (server, config) = parameters();
-    let connector = FingerprintConnector::new(
-        SslConnector::builder(SslMethod::tls()).unwrap(),
+    for profile in [
         ClientFingerprint::Chrome120,
-    )
-    .unwrap();
-    let mut connection = connector.configure(b"\x02h2\x08http/1.1").unwrap();
-    connection.set_reality_client(&config).unwrap();
-    let mut stream = capture(connection.into_ssl("reality.test").unwrap());
+        ClientFingerprint::Chrome133,
+        ClientFingerprint::Firefox120,
+        ClientFingerprint::Safari16,
+    ] {
+        let connector =
+            FingerprintConnector::new(SslConnector::builder(SslMethod::tls()).unwrap(), profile)
+                .unwrap();
+        for _ in 0..4 {
+            let mut connection = connector.configure(b"\x02h2\x08http/1.1").unwrap();
+            connection.set_reality_client(&config).unwrap();
+            let mut stream = capture(connection.into_ssl("reality.test").unwrap());
+            // Retry a partial initial write: the authenticated identity must not
+            // be resealed, and authentication binds the final profile's bytes.
+            stream.get_mut().budget = 7;
+            assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::WANT_WRITE);
+            stream.get_mut().budget = usize::MAX;
+            assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::WANT_READ);
+            let bytes = stream.get_ref().wire.clone();
+            assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::WANT_READ);
+            assert_eq!(stream.get_ref().wire, bytes);
+            let msg = hello(&bytes);
+            authenticate_hello(&server, &msg);
+            let (groups, shares) = hello_groups(&msg);
+            assert!(!groups.contains(&4588));
+            let expected = if profile == ClientFingerprint::Firefox120 {
+                vec![(29, 32), (23, 65)]
+            } else {
+                vec![(29, 32)]
+            };
+            assert_eq!(shares, expected, "{profile:?}");
+            assert!(stream.ssl_mut().set_reality_client(&config).is_err());
+        }
+    }
+}
+
+fn hello_groups(msg: &[u8]) -> (Vec<u16>, Vec<(u16, usize)>) {
+    let mut cursor = 71;
+    cursor += 2 + u16_at(msg, cursor);
+    cursor += 1 + usize::from(msg[cursor]);
+    let end = cursor + 2 + u16_at(msg, cursor);
+    cursor += 2;
+    let mut groups = Vec::new();
+    let mut shares = Vec::new();
+    while cursor < end {
+        let kind = u16_at(msg, cursor);
+        let len = u16_at(msg, cursor + 2);
+        cursor += 4;
+        if kind == 10 {
+            groups = msg[cursor + 2..cursor + len]
+                .chunks_exact(2)
+                .map(|x| u16::from_be_bytes([x[0], x[1]]))
+                .filter(|id| id & 0x0f0f != 0x0a0a)
+                .collect();
+        } else if kind == 51 {
+            let mut at = cursor + 2;
+            while at < cursor + len {
+                let id = u16_at(msg, at) as u16;
+                let size = u16_at(msg, at + 2);
+                if id & 0x0f0f != 0x0a0a {
+                    shares.push((id, size));
+                }
+                at += 4 + size;
+            }
+            assert_eq!(at, cursor + len);
+        }
+        cursor += len;
+    }
+    assert_eq!(cursor, end);
+    (groups, shares)
+}
+
+#[test]
+fn reality_binds_x25519_even_when_it_is_not_the_first_share() {
+    use foreign_types::ForeignTypeRef;
+    let (server, config) = parameters();
+    let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
+    ctx.set_curves_list("P-256:X25519:P-384").unwrap();
+    let mut ssl = Ssl::new(&ctx.build()).unwrap();
+    let shares = [23, 29];
+    unsafe {
+        assert_eq!(
+            boring_sys::SSL_set1_client_key_shares(ssl.as_ptr(), shares.as_ptr(), 2),
+            1
+        );
+    }
+    ssl.set_reality_client(&config).unwrap();
+    let mut stream = capture(ssl);
     assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::WANT_READ);
-    authenticate_hello(&server, &hello(&stream.get_ref().wire));
+    let msg = hello(&stream.get_ref().wire);
+    assert_eq!(hello_groups(&msg).1, [(23, 65), (29, 32)]);
+    authenticate_hello(&server, &msg);
 }
 
 #[test]
@@ -253,6 +336,35 @@ fn dtls_and_changed_key_share_configuration_fail_closed() {
     let mut stream = capture(ssl);
     assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::SSL);
     assert!(stream.get_ref().wire.is_empty());
+}
+
+#[test]
+fn reality_rejects_reintroduced_pq_and_early_data_before_io() {
+    use foreign_types::ForeignTypeRef;
+    let (_, parameters) = parameters();
+    for pq in [false, true] {
+        let mut ssl = client(&parameters);
+        unsafe {
+            if pq {
+                ssl.set_curves_list("X25519MLKEM768:X25519").unwrap();
+                let shares = [4588, 29];
+                assert_eq!(
+                    boring_sys::SSL_set1_client_key_shares(ssl.as_ptr(), shares.as_ptr(), 2),
+                    1
+                );
+            } else {
+                boring_sys::SSL_set_early_data_enabled(ssl.as_ptr(), 1);
+            }
+        }
+        let mut stream = capture(ssl);
+        assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::SSL);
+        assert!(stream.get_ref().wire.is_empty());
+    }
+    let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
+    ctx.set_curves_list("P-256").unwrap();
+    let mut ssl = Ssl::new(&ctx.build()).unwrap();
+    // No hidden identity key may be created when X25519 is unavailable.
+    assert!(ssl.set_reality_client(&parameters).is_err());
 }
 
 fn der(tag: u8, payload: &[u8]) -> Vec<u8> {
@@ -355,13 +467,14 @@ impl boring::ssl::PrivateKeyMethod for BadSignature {
 }
 
 fn memory_handshake(
+    make_client: impl FnOnce(&RealityClientConfig) -> Ssl,
     bad_hmac: bool,
     bad_signature: bool,
     extra_cert: bool,
     large: bool,
 ) -> Result<(), String> {
     let (static_key, parameters) = parameters();
-    let mut ssl = client(&parameters);
+    let mut ssl = make_client(&parameters);
     // The unmodified native TLS test server obeys the advertised list, unlike
     // a REALITY server. Chrome's unchanged list is covered by Mihomo interop.
     ssl.set_verify_algorithm_prefs(&[boring::ssl::SslSignatureAlgorithm::ED25519])
@@ -419,8 +532,8 @@ fn memory_handshake(
 
 #[test]
 fn real_certificate_verify_is_required_after_hmac_authentication() {
-    memory_handshake(false, false, false, false).unwrap();
-    let error = memory_handshake(false, true, false, false).unwrap_err();
+    memory_handshake(client, false, false, false, false).unwrap();
+    let error = memory_handshake(client, false, true, false, false).unwrap_err();
     assert!(error.contains("BAD_SIGNATURE"), "{error}");
 }
 
@@ -431,7 +544,52 @@ fn certificate_hmac_chain_and_size_cannot_be_bypassed() {
         (false, true, false),
         (false, false, true),
     ] {
-        let error = memory_handshake(bad_hmac, false, extra, large).unwrap_err();
+        let error = memory_handshake(client, bad_hmac, false, extra, large).unwrap_err();
         assert!(error.contains("CERTIFICATE_VERIFY_FAILED"), "{error}");
+    }
+}
+
+#[cfg(feature = "client-fingerprint")]
+#[test]
+fn each_profile_requires_temporary_certificate_hmac_and_native_proof() {
+    use boring::ssl::{ClientFingerprint, FingerprintConnector, SslConnector};
+    for profile in [
+        ClientFingerprint::Chrome120,
+        ClientFingerprint::Chrome133,
+        ClientFingerprint::Firefox120,
+        ClientFingerprint::Safari16,
+    ] {
+        let connector =
+            FingerprintConnector::new(SslConnector::builder(SslMethod::tls()).unwrap(), profile)
+                .unwrap();
+        let make_client = |reality: &RealityClientConfig| {
+            let mut configuration = connector.configure(b"\x02h2").unwrap();
+            configuration.set_reality_client(reality).unwrap();
+            configuration.into_ssl("reality.test").unwrap()
+        };
+        // Native peer obeys sigalgs, so memory_handshake advertises Ed25519 for
+        // this crypto gate only. Separate wire vectors preserve the real list;
+        // the later independent Mihomo gate uses that unmodified profile.
+        memory_handshake(make_client, false, false, false, false).unwrap();
+        for (bad_hmac, bad_signature, extra, large, expected) in [
+            (true, false, false, false, "CERTIFICATE_VERIFY_FAILED"),
+            (false, true, false, false, "BAD_SIGNATURE"),
+            (false, false, true, false, "CERTIFICATE_VERIFY_FAILED"),
+            (false, false, false, true, "CERTIFICATE_VERIFY_FAILED"),
+        ] {
+            let error =
+                memory_handshake(make_client, bad_hmac, bad_signature, extra, large).unwrap_err();
+            assert!(error.contains(expected), "{profile:?}: {error}");
+        }
+        for public in [[0; 32], {
+            let mut public = [0; 32];
+            public[0] = 1;
+            public
+        }] {
+            let parameters = RealityClientConfig::new(public, &[], [1, 8, 0]).unwrap();
+            let mut stream = capture(make_client(&parameters));
+            assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::SSL);
+            assert!(stream.get_ref().wire.is_empty());
+        }
     }
 }

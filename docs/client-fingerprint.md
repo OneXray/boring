@@ -58,9 +58,11 @@ exception and native CertificateVerify checks remain in the native handshake.
 The full connection-local invariants and deliberately unsupported combinations
 are documented in [REALITY](reality-client.md).
 
-CF2/CF3 validate the additional profiles only for ordinary TLS. Their classic
-REALITY shape and authentication integration remain CF4 work; ordinary-TLS
-ML-KEM is not PQ REALITY.
+The [CF4 fork-local checks](client-fingerprint-cf4-fork.md) cover all four
+profiles' classic REALITY shape and authentication binding. Classic mode removes
+Chrome133's ML-KEM group/share and preserves Firefox's additional P-256 share.
+Independent VCore/Mihomo data paths still require application integration and
+fresh container acceptance; ordinary-TLS ML-KEM is not PQ REALITY.
 
 ## Scope and verification
 
