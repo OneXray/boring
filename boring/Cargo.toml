@@ -21,6 +21,7 @@ default = []
 reality = ["boring-sys/reality"]
 shadow-tls-v3 = ["reality", "boring-sys/shadow-tls-v3"]
 jls = ["shadow-tls-v3", "boring-sys/jls"]
+restls = ["jls", "boring-sys/restls"]
 client-fingerprint = ["dep:brotli", "dep:flate2", "boring-sys/client-fingerprint"]
 
 # Use a FIPS-validated version of BoringSSL.
@@ -76,6 +77,7 @@ libc = { workspace = true }
 boring-sys = { workspace = true }
 
 [dev-dependencies]
+blake3 = "1.8.7"
 hex = { workspace = true }
 rusty-hook = { workspace = true }
 brotli = { workspace = true }

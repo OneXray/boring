@@ -1,0 +1,147 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -2782,3 +2782,13 @@
+     const uint8_t *password, size_t password_len);
++
++// Restls delegates only keyed BLAKE3 of public wire bytes to the caller. The
++// callback must return one and write 32 bytes, or return zero to fail closed.
++// It never receives private ECDHE keys or TLS traffic secrets. TLS >=1.2,
++// certificate policy, signatures and Finished remain native and mandatory.
++typedef int (*SSL_restls_hash_cb)(SSL *ssl, const uint8_t *data, size_t len,
++                                  uint8_t out[32]);
++OPENSSL_EXPORT int SSL_set_restls_client(SSL *ssl, uint16_t version_hint,
++                                         SSL_restls_hash_cb hash);
++OPENSSL_EXPORT int SSL_restls_authenticated(const SSL *ssl);
+ 
+ // SSL_set1_server_supported_groups_hint, when |ssl| is a client, indicates that
+diff --git a/ssl/internal.h b/ssl/internal.h
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -1808,3 +1808,6 @@
+   bool jls_server_authenticated = false;
++  bool restls_hello_prepared = false;
++  UniquePtr<SSLKeyShare> restls_eager_keys[3];
++  Array<uint8_t> restls_eager_public[3];
+   bool reality_authenticated = false;
+   void ClearRealityAuth();
+@@ -2325,2 +2328,5 @@
+ bool ssl_verify_jls_server_hello(SSL_HANDSHAKE *hs, Span<const uint8_t> msg);
++bool ssl_restls_open_record(SSL *ssl, Span<uint8_t> *out, uint8_t type,
++                            uint16_t version, Span<const uint8_t> header,
++                            Span<uint8_t> body);
+ 
+@@ -2808,2 +2814,4 @@
+   uint8_t client_random[SSL3_RANDOM_SIZE] = {0};
++  bool restls_auth_attempted = false;
++  bool restls_server_authenticated = false;
+ 
+@@ -3410,2 +3418,8 @@
+   std::optional<JlsClient> jls_client;
++
++  struct RestlsClient {
++    uint16_t version_hint;
++    SSL_restls_hash_cb hash;
++  };
++  std::optional<RestlsClient> restls_client;
+ 
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -2088,1 +2088,25 @@
++int SSL_set_restls_client(SSL *ssl, uint16_t version_hint,
++                          SSL_restls_hash_cb hash) {
++  if (!ssl || !ssl->config || !hash ||
++      (version_hint != TLS1_2_VERSION && version_hint != TLS1_3_VERSION) ||
++      ssl->server || SSL_is_dtls(ssl) || SSL_is_quic(ssl) ||
++      ssl->enable_early_data || ssl->s3->initial_handshake_complete ||
++      (ssl->s3->hs && ssl->s3->hs->max_version != 0) ||
++      ssl->config->restls_client || ssl->config->reality_client ||
++      ssl->config->shadow_tls_v3 || ssl->config->jls_client ||
++      !ssl->config->client_ech_config_list.empty() ||
++      (SSL_get_mode(ssl) & SSL_MODE_ENABLE_FALSE_START)) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
++    return 0;
++  }
++  ssl->config->restls_client.emplace(SSL_CONFIG::RestlsClient{version_hint, hash});
++  return 1;
++}
++
++int SSL_restls_authenticated(const SSL *ssl) {
++  return ssl && ssl->config && ssl->config->restls_client &&
++      ssl->s3->restls_server_authenticated &&
++      ssl->s3->initial_handshake_complete && !SSL_in_init(ssl);
++}
++
+ int SSL_set1_jls_client(SSL *ssl, const uint8_t *username,
+@@ -2099,3 +2126,4 @@
+       ssl->config->jls_client ||
++      ssl->config->restls_client ||
+       !ssl->config->client_ech_config_list.empty()) {
+     OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
+@@ -2120,3 +2148,4 @@
+       ssl->config->jls_client ||
++      ssl->config->restls_client ||
+       !ssl->config->client_ech_config_list.empty()) {
+     OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
+@@ -2151,3 +2180,4 @@
+       ssl->config->jls_client ||
++      ssl->config->restls_client ||
+       !ssl->config->client_ech_config_list.empty()) {
+     OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
+diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
+--- a/ssl/handshake_client.cc
++++ b/ssl/handshake_client.cc
+@@ -445,3 +445,8 @@
++#include "restls_client.inc"
++
+ bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
+   SSL *const ssl = hs->ssl;
++  if (!restls_prepare_client_hello(hs)) {
++    return false;
++  }
+   if (hs->config->jls_client &&
+@@ -1768,3 +1773,8 @@
+     uint8_t alert = SSL_AD_DECODE_ERROR;
+-    if (!kem || !kem->Encap(&child, &pms, &alert, hs->peer_key)) {
++    const bool restls_eager = hs->config->restls_client &&
++        hs->config->restls_client->version_hint == TLS1_2_VERSION;
++    const bool exchanged = restls_eager
++        ? restls_client_key_exchange(hs, &child, &pms, &alert)
++        : kem && kem->Encap(&child, &pms, &alert, hs->peer_key);
++    if (!exchanged) {
+       ssl_send_alert(ssl, SSL3_AL_FATAL, alert);
+@@ -1932,2 +1943,5 @@
+ static bool can_false_start(const SSL_HANDSHAKE *hs) {
++  if (hs->config->restls_client) {
++    return false;
++  }
+   const SSL *const ssl = hs->ssl;
+@@ -2080,3 +2094,8 @@
+ static enum ssl_hs_wait_t do_finish_client_handshake(SSL_HANDSHAKE *hs) {
+   SSL *const ssl = hs->ssl;
++  if (hs->config->restls_client && !ssl->s3->restls_server_authenticated) {
++    ssl_send_alert(ssl, SSL3_AL_FATAL, SSL_AD_HANDSHAKE_FAILURE);
++    OPENSSL_PUT_ERROR(SSL, SSL_R_HANDSHAKE_FAILURE_ON_CLIENT_HELLO);
++    return ssl_hs_error;
++  }
+   if (ssl->s3->ech_status == ssl_ech_rejected) {
+diff --git a/ssl/tls_record.cc b/ssl/tls_record.cc
+--- a/ssl/tls_record.cc
++++ b/ssl/tls_record.cc
+@@ -182,4 +182,4 @@
+-  if (!ssl->s3->aead_read_ctx->Open(
+-          out, type, version, ssl->s3->read_sequence, header,
++  if (!ssl_restls_open_record(
++          ssl, out, type, version, header,
+           Span(const_cast<uint8_t *>(CBS_data(&body)), CBS_len(&body)))) {
+     if (ssl->s3->skip_early_data && !ssl->s3->aead_read_ctx->is_null_cipher()) {
+diff --git a/ssl/handshake.cc b/ssl/handshake.cc
+--- a/ssl/handshake.cc
++++ b/ssl/handshake.cc
+@@ -786,4 +786,4 @@
+     if ((hs->config->reality_client || hs->config->shadow_tls_v3 ||
+-         hs->config->jls_client) && ssl->server) {
++         hs->config->jls_client || hs->config->restls_client) && ssl->server) {
+       OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
+       hs->wait = ssl_hs_error;

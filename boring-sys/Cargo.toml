@@ -53,6 +53,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 reality = []
 shadow-tls-v3 = ["reality"]
 jls = ["shadow-tls-v3"]
+restls = ["jls"]
 client-fingerprint = []
 
 # Compile boringssl using the FIPS build flag if building boringssl from

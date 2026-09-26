@@ -21,6 +21,7 @@ default = ["boring/default"]
 reality = ["boring/reality"]
 shadow-tls-v3 = ["boring/shadow-tls-v3"]
 jls = ["boring/jls"]
+restls = ["boring/restls"]
 client-fingerprint = ["boring/client-fingerprint"]
 
 # Use a FIPS-validated version of boringssl.
