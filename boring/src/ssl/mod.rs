@@ -131,6 +131,8 @@ mod fingerprint;
 mod mut_only;
 #[cfg(feature = "reality")]
 mod reality;
+#[cfg(feature = "shadow-tls-v3")]
+mod shadow_tls;
 #[cfg(test)]
 mod test;
 

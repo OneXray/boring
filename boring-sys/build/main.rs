@@ -538,6 +538,12 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
         apply_patch(config, "reality-client.patch")?;
     }
 
+    if config.features.shadow_tls_v3 {
+        println!("cargo:rerun-if-changed=patches/shadow-tls-v3.patch");
+        println!("cargo:warning=applying opt-in ShadowTLS v3 ClientHello hook");
+        apply_patch(config, "shadow-tls-v3.patch")?;
+    }
+
     Ok(())
 }
 

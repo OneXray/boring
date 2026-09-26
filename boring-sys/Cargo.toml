@@ -51,6 +51,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 # Opt-in classic REALITY client support from this fork.
 reality = []
+shadow-tls-v3 = ["reality"]
 client-fingerprint = []
 
 # Compile boringssl using the FIPS build flag if building boringssl from
