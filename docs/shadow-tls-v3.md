@@ -1,5 +1,11 @@
 # ShadowTLS v3 ClientHello hook
 
+Subsequent publication: the user separately authorized publishing
+`de7bf4943ff9cd4b40e6f1d3ee98939284aa63b1` to `feat/n7-security-handshakes` and
+letting VCore pin that immutable revision. The push and remote-SHA check succeeded.
+The original gate below remains its pre-publication evidence, not VCore production
+acceptance. Later JLS/Restls changes require their own publication authority.
+
 2026-09-26. Independent owned-fork branch `feat/n7-security-handshakes`,
 base `b7639ab7`. The user approved minimal per-protocol native extensions and
 local tests, not publication or a new TLS engine. **The isolated fork capability
