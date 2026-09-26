@@ -4,7 +4,7 @@ Subsequent publication: the user separately authorized publishing
 `de7bf4943ff9cd4b40e6f1d3ee98939284aa63b1` to `feat/n7-security-handshakes` and
 letting VCore pin that immutable revision. The push and remote-SHA check succeeded.
 The original gate below remains its pre-publication evidence, not VCore production
-acceptance. Later JLS/Restls changes require their own publication authority.
+acceptance.
 
 2026-09-26. Independent owned-fork branch `feat/n7-security-handshakes`,
 base `b7639ab7`. The user approved minimal per-protocol native extensions and
@@ -141,5 +141,5 @@ uv run --project "$n7_core/scripts" --locked python tests/interop/shadow_tls_v3.
 
 This gate establishes the minimal hook's capability. The blocking synthetic probe
 is not a production API and has no runtime DNS, protected Dialer, proxy-group,
-asynchronous cancellation/Stop or download-leg implementation. Restls and JLS are
-separate hooks/gates; no success here signs off those protocols or full N7.
+asynchronous cancellation/Stop or download-leg implementation. No success here
+signs off full VCore N7.

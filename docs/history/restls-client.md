@@ -1,5 +1,9 @@
 # Restls native hook — fork-local acceptance
 
+> Retired on 2026-09-26. Restls support, public APIs, native patches, features and
+> probes have been removed. The following is historical evidence for the old
+> revision, not a current contract or runnable test guide.
+
 2026-09-26. Branch `feat/n7-restls-handshake`, based on published JLS revision
 `a859a66311c82a2f2bf2d0bc392e1475c8615b66`. The **fork-local native hook gate passes**.
 This is unpublished work, not VCore integration, N7.4 acceptance, or permission
@@ -74,7 +78,7 @@ complete client script/async adapter still belongs to the VCore implementation.
   fresh hello authentication and EOF after the owned task joins.
 - Apple library checks: ARM64 iOS, ARM64 simulator, x64 simulator and x64 macOS.
   Android library checks: ARM64/x64 with NDK r30 `30.0.16248370`, explicit API24
-  bindgen targets and plain NDK compiler paths from [the hybrid gate](reality-hybrid.md).
+  bindgen targets and plain NDK compiler paths from [the hybrid gate](../reality-hybrid.md).
   Native macOS ARM64 is covered by the executed tests. These are not device,
   Windows or VCore production-linking results.
 - Library/probe Clippy with `-D warnings`, Rustdoc with `-D warnings`, rustfmt,

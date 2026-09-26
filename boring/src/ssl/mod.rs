@@ -117,8 +117,6 @@ pub use self::error::{Error, ErrorCode, HandshakeError};
 pub use self::fingerprint::{ClientFingerprint, FingerprintConnector};
 #[cfg(feature = "reality")]
 pub use self::reality::RealityClientConfig;
-#[cfg(feature = "restls")]
-pub use self::restls::{RestlsClientConfig, RestlsVersionHint};
 
 mod async_callbacks;
 mod bio;
@@ -130,13 +128,9 @@ mod ech;
 mod error;
 #[cfg(feature = "client-fingerprint")]
 mod fingerprint;
-#[cfg(feature = "jls")]
-mod jls;
 mod mut_only;
 #[cfg(feature = "reality")]
 mod reality;
-#[cfg(feature = "restls")]
-mod restls;
 #[cfg(feature = "shadow-tls-v3")]
 mod shadow_tls;
 #[cfg(test)]

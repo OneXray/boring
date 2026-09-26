@@ -20,8 +20,6 @@ pub(crate) struct Config {
 pub(crate) struct Features {
     pub(crate) reality: bool,
     pub(crate) shadow_tls_v3: bool,
-    pub(crate) jls: bool,
-    pub(crate) restls: bool,
     pub(crate) client_fingerprint: bool,
     pub(crate) fips: bool,
     pub(crate) rpk: bool,
@@ -156,8 +154,6 @@ impl Features {
         Self {
             reality: cfg!(feature = "reality"),
             shadow_tls_v3: cfg!(feature = "shadow-tls-v3"),
-            jls: cfg!(feature = "jls"),
-            restls: cfg!(feature = "restls"),
             client_fingerprint: cfg!(feature = "client-fingerprint"),
             fips: cfg!(feature = "fips"),
             rpk: cfg!(feature = "rpk"),

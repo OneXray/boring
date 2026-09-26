@@ -544,23 +544,6 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
         apply_patch(config, "shadow-tls-v3.patch")?;
     }
 
-    if config.features.jls {
-        println!("cargo:rerun-if-changed=patches/jls-client.patch");
-        println!("cargo:warning=applying opt-in JLS hello authentication hook");
-        apply_patch(config, "jls-client.patch")?;
-    }
-
-    if config.features.restls {
-        println!("cargo:rerun-if-changed=patches/restls-client.patch");
-        println!("cargo:rerun-if-changed=patches/restls_client.inc");
-        println!("cargo:warning=applying opt-in Restls native authentication hook");
-        std::fs::copy(
-            config.manifest_dir.join("patches/restls_client.inc"),
-            get_boringssl_source_path(config).join("ssl/restls_client.inc"),
-        )?;
-        apply_patch(config, "restls-client.patch")?;
-    }
-
     Ok(())
 }
 
