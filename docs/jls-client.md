@@ -1,9 +1,5 @@
 # JLS native client authentication
 
-> Retired on 2026-09-26. JLS support, public APIs, native patches, features and
-> probes have been removed. The following is historical evidence for the old
-> revision, not a current contract or runnable test guide.
-
 2026-09-26. Owned branch `feat/n7-security-handshakes`, parent
 `de7bf4943ff9cd4b40e6f1d3ee98939284aa63b1`. The user approved a minimal native
 JLS extension and local validation. **This new hook is not published or used
@@ -83,7 +79,7 @@ Apple four cross-target library checks (ARM64 iOS device and simulator, x64 iOS
 simulator and x64 macOS) and Android ARM64/x64 library checks pass with
 `jls,shadow-tls-v3,client-fingerprint`. Native macOS ARM64 is covered above. Android
 uses the explicit API-24 bindgen arguments and plain NDK clang paths recorded in
-[the hybrid gate](../reality-hybrid.md). These are not VCore production linking,
+[the hybrid gate](reality-hybrid.md). These are not VCore production linking,
 Windows or physical-device results.
 
 ## Independent official server gate

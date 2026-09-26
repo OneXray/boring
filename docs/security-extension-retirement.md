@@ -1,29 +1,29 @@
-# JLS and Restls retirement
+# Restls retirement; JLS retained
 
-2026-09-26. On `chore/remove-jls-restls`, parent
-`d8d6d92912a5e6bd1c43f4c8e1c78fd4a2d74544`, remove both owned extensions at the
-user's request. The Rust APIs, Cargo features, native patches, build integration,
-examples and dedicated tests/interop probes are gone. There is no compatibility
-shim or disabled copy of their production implementation. Git history remains.
+2026-09-26. The final user decision is to remove **only Restls**. The earlier
+`60ae6765` cleanup removed both protocols; this follow-up restores JLS without
+rewriting published history. Restls Rust APIs, Cargo features, native patches,
+build integration, examples and dedicated tests/interop probes remain removed.
 
-The retained production code, tests and probes are byte-identical to the
-ShadowTLS baseline `de7bf4943ff9cd4b40e6f1d3ee98939284aa63b1`. REALITY, hybrid
-REALITY, ShadowTLS v3, selected ClientHello profiles and public ML-KEM remain.
+The retained production code, tests and probes match the JLS baseline
+`a859a66311c82a2f2bf2d0bc392e1475c8615b66`. JLS, REALITY, hybrid REALITY,
+ShadowTLS v3, selected ClientHello profiles and public ML-KEM remain available.
 The BoringSSL submodule stays at `e2a57cfb4d915b4ba820585aef9fdee7bca13fe5`
-with a clean checkout. Previous evidence is archived under `docs/history/`;
+with a clean checkout. Only Restls evidence is archived under `docs/history/`;
 its old commands and support claims are not current instructions.
 
-## Executed local regression
+## Executed final local regression
 
 macOS ARM64, 2026-09-26. All test peers below use memory IO, not host listeners.
 
-- Boring Debug and Release: 27/27 each (`shadow_tls`, `reality`,
+- Boring Debug and Release: 30/30 each (`jls`, `shadow_tls`, `reality`,
   `selected_fingerprint`, `client_fingerprint`).
-- Tokio Debug: 19/19 (`shadow_tls`, `selected_fingerprint`, `client_fingerprint`).
-- Tokio Release: 3/3 (`shadow_tls`).
-- Default boring/Tokio library check, selected-library/test Clippy with
-  `-D warnings`, rustfmt and diff checks pass.
-- Cargo metadata contains neither retired feature in any of the three crates.
+- Tokio Debug: 21/21 (`jls`, `shadow_tls`, `selected_fingerprint`,
+  `client_fingerprint`).
+- Tokio Release: 5/5 (`jls`, `shadow_tls`).
+- Selected-library/test Clippy with `-D warnings`, rustfmt and diff checks pass.
+- Default boring/Tokio library check passed during the initial removal; the
+  restored JLS code is opt-in. Cargo metadata retains JLS and omits Restls.
 
 The initial `--locked` invocation correctly required refreshing the local
 ignored lockfile after removing the Restls-only BLAKE3 dev-dependency. One

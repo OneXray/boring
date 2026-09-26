@@ -544,6 +544,12 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
         apply_patch(config, "shadow-tls-v3.patch")?;
     }
 
+    if config.features.jls {
+        println!("cargo:rerun-if-changed=patches/jls-client.patch");
+        println!("cargo:warning=applying opt-in JLS hello authentication hook");
+        apply_patch(config, "jls-client.patch")?;
+    }
+
     Ok(())
 }
 

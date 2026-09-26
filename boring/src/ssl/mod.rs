@@ -128,6 +128,8 @@ mod ech;
 mod error;
 #[cfg(feature = "client-fingerprint")]
 mod fingerprint;
+#[cfg(feature = "jls")]
+mod jls;
 mod mut_only;
 #[cfg(feature = "reality")]
 mod reality;
