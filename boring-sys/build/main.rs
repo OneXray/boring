@@ -534,7 +534,7 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
 
     if config.features.reality {
         println!("cargo:rerun-if-changed=patches/reality-client.patch");
-        println!("cargo:warning=applying opt-in classic REALITY client patch");
+        println!("cargo:warning=applying opt-in REALITY client patch (classic by default)");
         apply_patch(config, "reality-client.patch")?;
     }
 

@@ -98,6 +98,7 @@ fn wire_auth_key(server: &PKey<Private>, msg: &[u8]) -> [u8; 32] {
     let end = cursor + 2 + u16_at(msg, cursor);
     cursor += 2;
     let mut public = None;
+    let mut hybrid_public = None;
     while cursor < end {
         let kind = u16_at(msg, cursor);
         let len = u16_at(msg, cursor + 2);
@@ -110,6 +111,9 @@ fn wire_auth_key(server: &PKey<Private>, msg: &[u8]) -> [u8; 32] {
                 if group == 29 {
                     assert_eq!(size, 32);
                     public = Some(&msg[share + 4..share + 4 + size]);
+                } else if group == 4588 {
+                    assert_eq!(size, 1184 + 32);
+                    hybrid_public = Some(&msg[share + 4 + 1184..share + 4 + size]);
                 }
                 share += 4 + size;
             }
@@ -120,7 +124,9 @@ fn wire_auth_key(server: &PKey<Private>, msg: &[u8]) -> [u8; 32] {
     let mut spki = vec![
         0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0,
     ];
-    spki.extend_from_slice(public.unwrap());
+    // Independent Mihomo server rule: prefer the classic share when present,
+    // otherwise authenticate the X25519 tail of the hybrid share.
+    spki.extend_from_slice(public.or(hybrid_public).unwrap());
     let peer = PKey::public_key_from_der(&spki).unwrap();
     let mut derive = Deriver::new(server).unwrap();
     derive.set_peer(&peer).unwrap();
@@ -171,6 +177,61 @@ fn hello_authenticates_wire_key_share_and_final_aad() {
     let mut stream = capture(client(&config));
     assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::WANT_READ);
     authenticate_hello(&server, &hello(&stream.get_ref().wire));
+}
+
+fn hybrid_only_client(config: &RealityClientConfig) -> Ssl {
+    let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
+    ctx.set_min_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+    ctx.set_max_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+    ctx.set_curves_list("X25519MLKEM768").unwrap();
+    let mut ssl = Ssl::new(&ctx.build()).unwrap();
+    ssl.set_hostname("reality.test").unwrap();
+    ssl.set_reality_client(&config.clone().require_x25519mlkem768())
+        .unwrap();
+    ssl
+}
+
+#[test]
+fn hybrid_only_reality_authenticates_with_its_own_ecdh_component() {
+    let (server, config) = parameters();
+    let mut stream = capture(hybrid_only_client(&config));
+    assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::WANT_READ);
+    let msg = hello(&stream.get_ref().wire);
+    assert_eq!(hello_groups(&msg).1, [(4588, 1216)]);
+    authenticate_hello(&server, &msg);
+    assert_eq!(
+        memory_handshake_with_group(
+            hybrid_only_client,
+            "X25519MLKEM768",
+            false,
+            false,
+            false,
+            false
+        )
+        .unwrap(),
+        4588
+    );
+}
+
+#[cfg(feature = "client-fingerprint")]
+#[test]
+fn explicit_hybrid_reality_preserves_chrome133_shares_and_authentication() {
+    use boring::ssl::{ClientFingerprint, FingerprintConnector, SslConnector};
+    let (server, config) = parameters();
+    let connector = FingerprintConnector::new(
+        SslConnector::builder(SslMethod::tls()).unwrap(),
+        ClientFingerprint::Chrome133,
+    )
+    .unwrap();
+    let mut connection = connector.configure(b"\x02h2").unwrap();
+    connection
+        .set_reality_client(&config.require_x25519mlkem768())
+        .unwrap();
+    let mut stream = capture(connection.into_ssl("reality.test").unwrap());
+    assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::WANT_READ);
+    let msg = hello(&stream.get_ref().wire);
+    assert_eq!(hello_groups(&msg).1, [(4588, 1216), (29, 32)]);
+    authenticate_hello(&server, &msg);
 }
 
 #[cfg(feature = "client-fingerprint")]
@@ -473,6 +534,25 @@ fn memory_handshake(
     extra_cert: bool,
     large: bool,
 ) -> Result<(), String> {
+    memory_handshake_with_group(
+        make_client,
+        "X25519",
+        bad_hmac,
+        bad_signature,
+        extra_cert,
+        large,
+    )
+    .map(|_| ())
+}
+
+fn memory_handshake_with_group(
+    make_client: impl FnOnce(&RealityClientConfig) -> Ssl,
+    server_group: &str,
+    bad_hmac: bool,
+    bad_signature: bool,
+    extra_cert: bool,
+    large: bool,
+) -> Result<u16, String> {
     let (static_key, parameters) = parameters();
     let mut ssl = make_client(&parameters);
     // The unmodified native TLS test server obeys the advertised list, unlike
@@ -489,7 +569,7 @@ fn memory_handshake(
     let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
     ctx.set_min_proto_version(Some(SslVersion::TLS1_3)).unwrap();
     ctx.set_max_proto_version(Some(SslVersion::TLS1_3)).unwrap();
-    ctx.set_curves_list("X25519").unwrap();
+    ctx.set_curves_list(server_group).unwrap();
     ctx.set_certificate(&cert).unwrap();
     if extra_cert {
         ctx.add_extra_chain_cert(cert).unwrap();
@@ -524,10 +604,131 @@ fn memory_handshake(
             }
         }
         if client_done && server_done {
-            return Ok(());
+            use foreign_types::ForeignTypeRef;
+            // Read-only public query on the completed native TLS connection.
+            return Ok(unsafe { boring_sys::SSL_get_group_id(client.ssl().as_ptr()) });
         }
     }
     panic!("bounded memory handshake failed to progress");
+}
+
+#[cfg(feature = "client-fingerprint")]
+#[test]
+fn required_hybrid_reality_negotiates_hybrid_and_rejects_classic_selection() {
+    use boring::ssl::{ClientFingerprint, FingerprintConnector, SslConnector};
+    let connector = FingerprintConnector::new(
+        SslConnector::builder(SslMethod::tls()).unwrap(),
+        ClientFingerprint::Chrome133,
+    )
+    .unwrap();
+    let make_client = |config: &RealityClientConfig| {
+        let mut connection = connector.configure(b"").unwrap();
+        connection
+            .set_reality_client(&config.clone().require_x25519mlkem768())
+            .unwrap();
+        connection.into_ssl("reality.test").unwrap()
+    };
+    assert_eq!(
+        memory_handshake_with_group(make_client, "X25519MLKEM768", false, false, false, false)
+            .unwrap(),
+        4588
+    );
+    let error =
+        memory_handshake_with_group(make_client, "X25519", false, false, false, false).unwrap_err();
+    assert!(error.contains("WRONG_CURVE"), "{error}");
+    let error =
+        memory_handshake_with_group(make_client, "P-384", false, false, false, false).unwrap_err();
+    assert!(error.contains("UNEXPECTED_MESSAGE"), "{error}");
+}
+
+#[test]
+fn hybrid_reality_keeps_certificate_authentication_and_native_proof_mandatory() {
+    for (bad_hmac, bad_signature, extra, large, expected) in [
+        (true, false, false, false, "CERTIFICATE_VERIFY_FAILED"),
+        (false, true, false, false, "BAD_SIGNATURE"),
+        (false, false, true, false, "CERTIFICATE_VERIFY_FAILED"),
+        (false, false, false, true, "CERTIFICATE_VERIFY_FAILED"),
+    ] {
+        let error = memory_handshake_with_group(
+            hybrid_only_client,
+            "X25519MLKEM768",
+            bad_hmac,
+            bad_signature,
+            extra,
+            large,
+        )
+        .unwrap_err();
+        assert!(error.contains(expected), "{error}");
+    }
+    for public in [[0; 32], {
+        let mut public = [0; 32];
+        public[0] = 1;
+        public
+    }] {
+        let config = RealityClientConfig::new(public, &[], [1, 8, 0]).unwrap();
+        let mut stream = capture(hybrid_only_client(&config));
+        assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::SSL);
+        assert!(stream.get_ref().wire.is_empty());
+    }
+}
+
+#[cfg(feature = "client-fingerprint")]
+#[test]
+fn incompatible_profiles_or_later_share_changes_cannot_disable_hybrid_requirement() {
+    use boring::ssl::{ClientFingerprint, FingerprintConnector, SslConnector};
+    use foreign_types::ForeignTypeRef;
+    let (_, config) = parameters();
+    for profile in [
+        ClientFingerprint::Chrome120,
+        ClientFingerprint::Firefox120,
+        ClientFingerprint::Safari16,
+    ] {
+        let connector =
+            FingerprintConnector::new(SslConnector::builder(SslMethod::tls()).unwrap(), profile)
+                .unwrap();
+        let mut connection = connector.configure(b"").unwrap();
+        assert!(connection
+            .set_reality_client(&config.clone().require_x25519mlkem768())
+            .is_err());
+        // A rejected config neither changes the template nor installs an
+        // unusable half-identity. The original classic config still works.
+        connection.set_reality_client(&config).unwrap();
+        let mut stream = capture(connection.into_ssl("reality.test").unwrap());
+        assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::WANT_READ);
+    }
+    let mut ssl = hybrid_only_client(&config);
+    ssl.set_curves_list("X25519").unwrap();
+    let shares = [29];
+    unsafe {
+        assert_eq!(
+            boring_sys::SSL_set1_client_key_shares(ssl.as_ptr(), shares.as_ptr(), 1),
+            1
+        );
+    }
+    let mut stream = capture(ssl);
+    assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::SSL);
+    assert!(stream.get_ref().wire.is_empty());
+}
+
+#[test]
+fn hybrid_retries_and_cancelled_connections_never_reuse_authentication() {
+    let (server, config) = parameters();
+    let mut identities = std::collections::HashSet::new();
+    for _ in 0..20 {
+        let mut stream = capture(hybrid_only_client(&config));
+        stream.get_mut().budget = 7;
+        assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::WANT_WRITE);
+        stream.get_mut().budget = usize::MAX;
+        assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::WANT_READ);
+        let wire = stream.get_ref().wire.clone();
+        let msg = hello(&wire);
+        authenticate_hello(&server, &msg);
+        assert!(identities.insert(msg[6..71].to_vec()));
+        assert_eq!(stream.connect().unwrap_err().code(), ErrorCode::WANT_READ);
+        assert_eq!(stream.get_ref().wire, wire);
+        assert!(stream.ssl_mut().set_reality_client(&config).is_err());
+        drop(stream);
+    }
 }
 
 #[test]

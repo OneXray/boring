@@ -64,6 +64,13 @@ Chrome133's ML-KEM group/share and preserves Firefox's additional P-256 share.
 Independent VCore/Mihomo data paths still require application integration and
 fresh container acceptance; ordinary-TLS ML-KEM is not PQ REALITY.
 
+For explicit hybrid REALITY, only Chrome133 among this fixed catalog has the
+required group/share. Configure `RealityClientConfig::require_x25519mlkem768`
+separately; classic remains the default. The other three profiles fail rather
+than changing their wire identities. Both actual hybrid negotiation and native
+REALITY authentication are required. See the independent [hybrid fork gate](reality-hybrid.md);
+its checks do not establish VCore's production/download-leg support.
+
 ## Scope and verification
 
 This is TLS ClientHello shaping, not HTTP/2/browser runtime impersonation, actual

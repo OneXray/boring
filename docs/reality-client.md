@@ -1,4 +1,4 @@
-# Classic REALITY client (opt-in)
+# REALITY client (opt-in, classic by default)
 
 This branch adds an opt-in `reality` feature on the existing 5.2.0 fork baseline.
 It is not by itself a production migration or a published release.
@@ -33,11 +33,12 @@ correct HMAC-SHA512 signature. Its CertificateVerify must pass native Ed25519
 verification. This narrow authenticated exception does not add Ed25519 to the
 browser's wire signature list or relax ordinary TLS signature policy.
 
-The implementation is classic X25519 authentication over TCP/TLS 1.3 only. The wire may advertise
-TLS 1.2 to match a browser, but negotiation below TLS 1.3 fails closed. Actual
-ECH, QUIC, DTLS, HRR, resumption, early data, server mode and PQ shares are
-rejected. ECH GREASE is distinct and remains usable. FIPS, RPK and external
-precompiled/native-source combinations are outside this slice.
+The implementation uses X25519 authentication over TCP/TLS 1.3 only. The wire may
+advertise TLS 1.2 to match a browser, but negotiation below TLS 1.3 fails closed.
+Actual ECH, QUIC, DTLS, HRR, resumption, early data and server mode are rejected.
+ECH GREASE is distinct and remains usable. FIPS, RPK and external
+precompiled/native-source combinations are outside this slice. Classic mode
+continues to reject hybrid shares; the explicit hybrid mode below is separate.
 
 The opt-in [named ClientHello profile](client-fingerprint.md) can be combined
 with this interface. Authentication still owns the same native key share and
@@ -49,6 +50,39 @@ It preserves other classic shares (including Firefox120's P-256) in order and
 binds authentication to the actual X25519 object, even if it is not first. Without
 explicit share configuration it selects X25519 alone. It creates no second
 identity key or global secret mapping; ordinary Chrome133 TLS still uses ML-KEM.
+
+### Explicit required hybrid mode
+
+`RealityClientConfig::new` is unchanged. Opt in for each immutable config:
+
+```rust,ignore
+let reality = RealityClientConfig::new(server_public_key, &short_id, [1, 8, 0])?
+    .require_x25519mlkem768();
+// Select Chrome133 or a native group/share list including X25519MLKEM768 first.
+ssl.set_reality_client(&reality)?;
+```
+
+This requires both a real native X25519MLKEM768 ClientHello share and that group
+in the negotiated connection. A classic ServerHello fails before key-share
+decapsulation. HRR remains unsupported; there is no silent classic retry. The
+mode preserves an explicit compatible list; without explicit shares it selects
+the hybrid group alone. Chrome120, Firefox120 and Safari16 are incompatible with
+this mode, not templates to silently upgrade or rename.
+
+Authentication uses the standalone X25519 share when present, otherwise the
+X25519 component of the actual hybrid share, matching Mihomo's server-side
+preference. ML-KEM key generation and the TLS shared secret stay native. The
+REALITY authentication key remains X25519-based; this is not a claim of
+post-quantum authentication or VLESS Encryption. No ephemeral private key is
+exported. Both hybrid key components are cleansed when their native owner drops.
+Late caller changes cannot remove the hybrid requirement or its authentication.
+The existing certificate HMAC, native CertificateVerify, one-use state, and
+failure/no-fallback invariants apply to both modes.
+
+The C interface adds `SSL_set1_reality_client_ex` with a flag accepting only zero
+or one. The original `SSL_set1_reality_client` retains classic semantics.
+[Hybrid fork acceptance](reality-hybrid.md) records the new tests independently
+from the historical classic results below.
 
 Auth state is connection-local, one-use and cleansed on authentication, native
 state-machine failure or handshake-state destruction. A transport I/O failure
@@ -129,8 +163,10 @@ VCore transport integration / ownership / Stop, portable pinned Git dependency
 resolution, affected target builds, physical devices, size and licensing/release
 review remain application/release gates. Earlier cross-builds are historical
 evidence and do not cover every later code change.
-Actual ECH, QUIC, PQ REALITY and resumption are deliberately unsupported here.
-No VCore production dependency change, commit, push or release is implied.
+Actual ECH, QUIC and resumption remain deliberately unsupported here. The
+explicit hybrid mode has its own fork-local gate; it does not complete VCore
+configuration, transport, download-leg or lifecycle integration. No VCore
+production dependency change, push or release is implied.
 
 The later [selected-v1 CF4 fork checks](client-fingerprint-cf4-fork.md) cover the
 new four-template binding. The historical container/device counts above are not

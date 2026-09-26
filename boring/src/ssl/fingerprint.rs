@@ -16,7 +16,7 @@ pub enum ClientFingerprint {
     /// This does not emulate HTTP/2 settings, QUIC, actual ECH or browser runtime.
     Chrome120,
     /// Chrome 133 with native X25519MLKEM768 + X25519 shares and new h2 ALPS.
-    /// This is ordinary stream TLS, not PQ REALITY or QUIC impersonation.
+    /// REALITY requires a separate explicit config; this does not shape QUIC.
     Chrome133,
     /// Firefox 120, with X25519/P-256 shares and its fixed extension order.
     Firefox120,

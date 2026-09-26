@@ -2,7 +2,7 @@ diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
 index 055b3e02..a44ca66b 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -2736,6 +2736,24 @@ OPENSSL_EXPORT int SSL_set1_client_key_shares(SSL *ssl,
+@@ -2736,6 +2736,33 @@ OPENSSL_EXPORT int SSL_set1_client_key_shares(SSL *ssl,
                                                const uint16_t *group_ids,
                                                size_t num_group_ids);
  
@@ -23,6 +23,15 @@ index 055b3e02..a44ca66b 100644
 +                                           const uint8_t *short_id,
 +                                           size_t short_id_len,
 +                                           const uint8_t client_version[3]);
++
++// SSL_set1_reality_client_ex additionally accepts a strict hybrid-mode flag
++// (zero or one). When one, configured X25519MLKEM768 groups/shares are kept
++// and required. A peer selecting a different group fails closed. Existing
++// classic behavior is preserved by SSL_set1_reality_client and flag zero.
++OPENSSL_EXPORT int SSL_set1_reality_client_ex(
++    SSL *ssl, const uint8_t server_public_key[32], const uint8_t *short_id,
++    size_t short_id_len, const uint8_t client_version[3],
++    int require_x25519mlkem768);
 +
  // SSL_set1_server_supported_groups_hint, when |ssl| is a client, indicates that
  // the server is likely to support groups listed in |server_groups|, in order of
@@ -58,7 +67,7 @@ index 2bea8f62..06a280fa 100644
    InplaceVector<uint8_t, SSL_MAX_MD_SIZE> secret;
    InplaceVector<uint8_t, SSL_MAX_MD_SIZE> early_traffic_secret;
    InplaceVector<uint8_t, SSL_MAX_MD_SIZE> client_handshake_secret;
-@@ -3356,6 +3369,13 @@ struct SSL_CONFIG {
+@@ -3356,6 +3369,14 @@ struct SSL_CONFIG {
    // ssl is a non-owning pointer to the parent |SSL| object.
    SSL *const ssl = nullptr;
  
@@ -66,6 +75,7 @@ index 2bea8f62..06a280fa 100644
 +    uint8_t server_public_key[32] = {};
 +    uint8_t short_id[8] = {};
 +    uint8_t client_version[3] = {};
++    bool require_x25519mlkem768 = false;
 +  };
 +  std::optional<RealityClient> reality_client;
 +
@@ -95,18 +105,47 @@ index d155b552..a30e9185 100644
  
    uint16_t GroupID() const override { return SSL_GROUP_X25519; }
  
+@@ -286,7 +296,18 @@ class X25519Kyber768KeyShare : public SSLKeyShare {
+ class X25519MLKEM768KeyShare : public SSLKeyShare {
+  public:
+-  X25519MLKEM768KeyShare() {}
++  X25519MLKEM768KeyShare() : x25519_private_key_{}, mlkem_private_key_{} {}
++
++  ~X25519MLKEM768KeyShare() override {
++    OPENSSL_cleanse(x25519_private_key_, sizeof(x25519_private_key_));
++    OPENSSL_cleanse(&mlkem_private_key_, sizeof(mlkem_private_key_));
++  }
++
++  bool RealitySharedSecret(uint8_t out[32],
++                           Span<const uint8_t> server_public_key) override {
++    return server_public_key.size() == 32 &&
++           X25519(out, x25519_private_key_, server_public_key.data());
++  }
+ 
+   uint16_t GroupID() const override { return SSL_GROUP_X25519_MLKEM768; }
+ 
+   bool Generate(CBB *out) override {
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
 index 89702eaa..90f05614 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
-@@ -2082,6 +2082,85 @@ int SSL_set1_client_key_shares(SSL *ssl, const uint16_t *group_ids,
+@@ -2082,6 +2082,102 @@ int SSL_set1_client_key_shares(SSL *ssl, const uint16_t *group_ids,
    return 1;
  }
  
 +int SSL_set1_reality_client(SSL *ssl, const uint8_t server_public_key[32],
 +                            const uint8_t *short_id, size_t short_id_len,
 +                            const uint8_t client_version[3]) {
++  return SSL_set1_reality_client_ex(ssl, server_public_key, short_id,
++                                      short_id_len, client_version, 0);
++}
++
++int SSL_set1_reality_client_ex(SSL *ssl, const uint8_t server_public_key[32],
++                               const uint8_t *short_id, size_t short_id_len,
++                               const uint8_t client_version[3],
++                               int require_x25519mlkem768) {
 +  if (!ssl || !ssl->config || !server_public_key || !client_version ||
++      (require_x25519mlkem768 != 0 && require_x25519mlkem768 != 1) ||
 +      short_id_len > 8 || (short_id_len != 0 && !short_id) || ssl->server ||
 +      SSL_is_dtls(ssl) || SSL_is_quic(ssl) || ssl->session ||
 +      ssl->enable_early_data || ssl->s3->initial_handshake_complete ||
@@ -133,7 +172,7 @@ index 89702eaa..90f05614 100644
 +                  SSL_GROUP_FLAG_EQUAL_PREFERENCE_WITH_NEXT) == 0) {
 +      rank++;
 +    }
-+    if (groups[i] != SSL_GROUP_X25519_MLKEM768) {
++    if (require_x25519mlkem768 || groups[i] != SSL_GROUP_X25519_MLKEM768) {
 +      groups[count] = groups[i];
 +      flags[count] = ssl->config->supported_group_list_flags[i] &
 +                     ~SSL_GROUP_FLAG_EQUAL_PREFERENCE_WITH_NEXT;
@@ -149,21 +188,28 @@ index 89702eaa..90f05614 100644
 +  InplaceVector<uint16_t, kNumNamedGroups> shares;
 +  if (ssl->config->client_key_share_selections) {
 +    for (uint16_t group : *ssl->config->client_key_share_selections) {
-+      if (group != SSL_GROUP_X25519_MLKEM768 && !shares.TryPushBack(group)) {
++      if ((require_x25519mlkem768 || group != SSL_GROUP_X25519_MLKEM768) &&
++          !shares.TryPushBack(group)) {
 +        return 0;
 +      }
 +    }
-+  } else if (!shares.TryPushBack(SSL_GROUP_X25519)) {
++  } else if (!shares.TryPushBack(require_x25519mlkem768
++                                     ? SSL_GROUP_X25519_MLKEM768
++                                     : SSL_GROUP_X25519)) {
 +    return 0;
 +  }
-+  if (std::find(shares.begin(), shares.end(), SSL_GROUP_X25519) == shares.end() ||
++  const uint16_t required_group = require_x25519mlkem768
++                                      ? SSL_GROUP_X25519_MLKEM768
++                                      : SSL_GROUP_X25519;
++  if (std::find(shares.begin(), shares.end(), required_group) == shares.end() ||
 +      !validate_key_shares(shares, groups)) {
 +    OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
 +    return 0;
 +  }
 +  for (uint16_t group : shares) {
 +    if (group != SSL_GROUP_X25519 && group != SSL_GROUP_SECP256R1 &&
-+        group != SSL_GROUP_SECP384R1 && group != SSL_GROUP_SECP521R1) {
++        group != SSL_GROUP_SECP384R1 && group != SSL_GROUP_SECP521R1 &&
++        !(require_x25519mlkem768 && group == SSL_GROUP_X25519_MLKEM768)) {
 +      OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
 +      return 0;
 +    }
@@ -174,6 +220,7 @@ index 89702eaa..90f05614 100644
 +  ssl->config->client_key_share_selections->CopyFrom(shares);
 +  ssl->config->reality_client.emplace();
 +  auto &reality = *ssl->config->reality_client;
++  reality.require_x25519mlkem768 = require_x25519mlkem768 != 0;
 +  OPENSSL_memcpy(reality.server_public_key, server_public_key, 32);
 +  OPENSSL_memcpy(reality.client_version, client_version, 3);
 +  if (short_id_len != 0) {
@@ -197,7 +244,7 @@ index 7ab6d2c5..f7036fd8 100644
  #include <openssl/md5.h>
  #include <openssl/mem.h>
  #include <openssl/rand.h>
-@@ -216,6 +217,83 @@ bool ssl_write_client_hello_without_extensions(const SSL_HANDSHAKE *hs,
+@@ -216,6 +217,93 @@ bool ssl_write_client_hello_without_extensions(const SSL_HANDSHAKE *hs,
    return true;
  }
  
@@ -217,19 +264,29 @@ index 7ab6d2c5..f7036fd8 100644
 +  // Bind the actual X25519 object, not a positional share or a separate key.
 +  // Firefox may also offer P-256. Recheck after caller configuration changes.
 +  SSLKeyShare *auth_share = nullptr;
++  SSLKeyShare *hybrid_share = nullptr;
 +  for (const auto &share : hs->key_shares) {
 +    const uint16_t group = share->GroupID();
 +    if (group == SSL_GROUP_X25519 && auth_share == nullptr) {
 +      auth_share = share.get();
++    } else if (group == SSL_GROUP_X25519_MLKEM768 && !hybrid_share &&
++               hs->config->reality_client->require_x25519mlkem768) {
++      hybrid_share = share.get();
 +    } else if (group != SSL_GROUP_SECP256R1 && group != SSL_GROUP_SECP384R1 &&
 +               group != SSL_GROUP_SECP521R1) {
 +      OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
 +      return false;
 +    }
 +  }
-+  if (auth_share == nullptr) {
++  if ((!auth_share && !hybrid_share) ||
++      (hs->config->reality_client->require_x25519mlkem768 && !hybrid_share)) {
 +    OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
 +    return false;
++  }
++  // Mihomo authenticates the standalone X25519 share when present, otherwise
++  // the X25519 component of the hybrid share. Neither secret is exported.
++  if (!auth_share) {
++    auth_share = hybrid_share;
 +  }
 +  struct SharedSecret {
 +    uint8_t bytes[32] = {};
@@ -281,7 +338,7 @@ index 7ab6d2c5..f7036fd8 100644
  bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
    SSL *const ssl = hs->ssl;
    ScopedCBB cbb;
-@@ -232,6 +310,9 @@ bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
+@@ -232,6 +320,9 @@ bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
      return false;
    }
  
@@ -291,7 +348,7 @@ index 7ab6d2c5..f7036fd8 100644
    return ssl->method->add_message(ssl, std::move(msg));
  }
  
-@@ -362,6 +443,15 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
+@@ -362,6 +453,15 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
      return ssl_hs_error;
    }
  
@@ -307,7 +364,7 @@ index 7ab6d2c5..f7036fd8 100644
    uint8_t ech_enc[EVP_HPKE_MAX_ENC_LENGTH];
    size_t ech_enc_len;
    if (!ssl_select_ech_config(hs, ech_enc, &ech_enc_len)) {
-@@ -670,7 +760,7 @@ static enum ssl_hs_wait_t do_read_server_hello(SSL_HANDSHAKE *hs) {
+@@ -670,7 +770,7 @@ static enum ssl_hs_wait_t do_read_server_hello(SSL_HANDSHAKE *hs) {
  
    // If this client only accepts non-certificate modes, then the server must
    // support TLS 1.3.
@@ -357,6 +414,21 @@ index db1a2913..84e06973 100644
    // The peer must have selected an algorithm that is consistent with its public
    // key, the TLS version, and what we advertised.
    Span<const uint16_t> sigalgs = tls12_get_verify_sigalgs(hs);
+@@ -2507,6 +2521,14 @@ bool ssl_ext_key_share_parse_serverhello(SSL_HANDSHAKE *hs,
+     return false;
+   }
+ 
++  if (hs->config->reality_client &&
++      hs->config->reality_client->require_x25519mlkem768 &&
++      group_id != SSL_GROUP_X25519_MLKEM768) {
++    *out_alert = SSL_AD_ILLEGAL_PARAMETER;
++    OPENSSL_PUT_ERROR(SSL, SSL_R_WRONG_CURVE);
++    return false;
++  }
++
+   const auto key_share_it =
+       std::find_if(hs->key_shares.begin(), hs->key_shares.end(),
+                    [group_id](const auto &key_share) {
 diff --git a/ssl/handshake.cc b/ssl/handshake.cc
 index 0148d5c9..c9613dd0 100644
 --- a/ssl/handshake.cc
