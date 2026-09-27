@@ -1,1 +1,3 @@
 *.toml text eol=lf
+# Unified-diff context lines intentionally contain one leading space.
+boring-sys/patches/*.patch whitespace=-blank-at-eol

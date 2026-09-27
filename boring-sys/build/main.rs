@@ -526,6 +526,30 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
         apply_patch(config, "relax-cert-validation.patch")?;
     }
 
+    if config.features.client_fingerprint {
+        println!("cargo:rerun-if-changed=patches/client-fingerprint.patch");
+        println!("cargo:warning=applying opt-in named client profile encoding patch");
+        apply_patch(config, "client-fingerprint.patch")?;
+    }
+
+    if config.features.reality {
+        println!("cargo:rerun-if-changed=patches/reality-client.patch");
+        println!("cargo:warning=applying opt-in REALITY client patch (classic by default)");
+        apply_patch(config, "reality-client.patch")?;
+    }
+
+    if config.features.shadow_tls_v3 {
+        println!("cargo:rerun-if-changed=patches/shadow-tls-v3.patch");
+        println!("cargo:warning=applying opt-in ShadowTLS v3 ClientHello hook");
+        apply_patch(config, "shadow-tls-v3.patch")?;
+    }
+
+    if config.features.jls {
+        println!("cargo:rerun-if-changed=patches/jls-client.patch");
+        println!("cargo:warning=applying opt-in JLS hello authentication hook");
+        apply_patch(config, "jls-client.patch")?;
+    }
+
     Ok(())
 }
 

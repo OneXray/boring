@@ -1,0 +1,193 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -2764,7 +2764,15 @@
+     size_t short_id_len, const uint8_t client_version[3],
+     int require_x25519mlkem768);
+ 
+-// SSL_set1_server_supported_groups_hint, when |ssl| is a client, indicates that
++// SSL_set1_shadow_tls_v3_client authenticates the final encoded ClientHello
++// session ID before transcript commitment. Copies a bounded, nonempty password
++// on a fresh TCP client SSL. No certificate/signature/Finished bypass is added.
++// The caller must separately authenticate the relay record layer. Sessions,
++// early data, actual ECH, REALITY, DTLS, QUIC and server mode are rejected.
++OPENSSL_EXPORT int SSL_set1_shadow_tls_v3_client(
++    SSL *ssl, const uint8_t *password, size_t password_len);
++
++// SSL_set1_server_supported_groups_hint, when |ssl| is a client, indicates that
+ // the server is likely to support groups listed in |server_groups|, in order of
+ // decreasing server preference. This function returns one on success and zero
+ // on error. This may be used when receiving a server hint, such as described in
+diff --git a/ssl/internal.h b/ssl/internal.h
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -1803,7 +1803,8 @@
+ 
+   uint8_t reality_auth_key[32] = {};
+   bool reality_auth_pending = false;
+-  bool reality_hello_sealed = false;
++  bool reality_hello_sealed = false;
++  bool shadow_tls_v3_hello_sealed = false;
+   bool reality_authenticated = false;
+   void ClearRealityAuth();
+ 
+@@ -3375,7 +3376,19 @@
+     uint8_t client_version[3] = {};
+     bool require_x25519mlkem768 = false;
+   };
+-  std::optional<RealityClient> reality_client;
++  std::optional<RealityClient> reality_client;
++
++  struct ShadowTlsV3 {
++    Array<uint8_t> password;
++    void ClearPassword() {
++      if (!password.empty()) {
++        OPENSSL_cleanse(password.data(), password.size());
++        password.Reset();
++      }
++    }
++    ~ShadowTlsV3() { ClearPassword(); }
++  };
++  std::optional<ShadowTlsV3> shadow_tls_v3;
+ 
+   // conf_max_version is the maximum acceptable version configured by
+   // |SSL_set_max_proto_version|. Note this version is not normalized in DTLS
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -2085,7 +2085,27 @@
+   return 1;
+ }
+ 
+-int SSL_set1_reality_client(SSL *ssl, const uint8_t server_public_key[32],
++int SSL_set1_shadow_tls_v3_client(SSL *ssl, const uint8_t *password,
++                                size_t password_len) {
++  if (!ssl || !ssl->config || !password || password_len == 0 ||
++      password_len > 65535 || ssl->server || SSL_is_dtls(ssl) ||
++      SSL_is_quic(ssl) || ssl->session || ssl->enable_early_data ||
++      ssl->s3->initial_handshake_complete ||
++      (ssl->s3->hs && ssl->s3->hs->max_version != 0) ||
++      ssl->config->reality_client || ssl->config->shadow_tls_v3 ||
++      !ssl->config->client_ech_config_list.empty()) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
++    return 0;
++  }
++  auto &state = ssl->config->shadow_tls_v3.emplace();
++  if (!state.password.CopyFrom(Span(password, password_len))) {
++    ssl->config->shadow_tls_v3.reset();
++    return 0;
++  }
++  return 1;
++}
++
++int SSL_set1_reality_client(SSL *ssl, const uint8_t server_public_key[32],
+                             const uint8_t *short_id, size_t short_id_len,
+                             const uint8_t client_version[3]) {
+   return SSL_set1_reality_client_ex(ssl, server_public_key, short_id,
+@@ -2102,7 +2122,7 @@
+       SSL_is_dtls(ssl) || SSL_is_quic(ssl) || ssl->session ||
+       ssl->enable_early_data || ssl->s3->initial_handshake_complete ||
+       (ssl->s3->hs && ssl->s3->hs->max_version != 0) ||
+-      ssl->config->reality_client ||
++      ssl->config->reality_client || ssl->config->shadow_tls_v3 ||
+       !ssl->config->client_ech_config_list.empty()) {
+     OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
+     return 0;
+diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
+--- a/ssl/handshake_client.cc
++++ b/ssl/handshake_client.cc
+@@ -30,7 +30,8 @@
+ #include <openssl/ecdsa.h>
+ #include <openssl/err.h>
+ #include <openssl/evp.h>
+-#include <openssl/hpke.h>
++#include <openssl/hpke.h>
++#include <openssl/hmac.h>
+ #include <openssl/hkdf.h>
+ #include <openssl/md5.h>
+ #include <openssl/mem.h>
+@@ -321,8 +322,60 @@
+   return true;
+ }
+ 
+-bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
+-  SSL *const ssl = hs->ssl;
++static bool seal_shadow_tls_v3_client_hello(SSL_HANDSHAKE *hs,
++                                           Span<uint8_t> msg) {
++  if (!hs->config->shadow_tls_v3 || hs->shadow_tls_v3_hello_sealed) {
++    // HRR keeps the first authenticated session ID, like Mihomo. It never
++    // regenerates a password MAC on a nonblocking retry or second hello.
++    return true;
++  }
++  constexpr size_t kSessionIdOffset = 4 + 2 + 32 + 1;
++  if (msg.size() < kSessionIdOffset + 32 || msg.size() > 65536 ||
++      msg[0] != SSL3_MT_CLIENT_HELLO || msg[kSessionIdOffset - 1] != 32 ||
++      hs->session_id.size() != 32) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
++    return false;
++  }
++  OPENSSL_memset(msg.data() + kSessionIdOffset + 28, 0, 4);
++  auto &state = *hs->config->shadow_tls_v3;
++  uint8_t mac[EVP_MAX_MD_SIZE];
++  unsigned mac_len = 0;
++  const bool valid = HMAC(EVP_sha1(), state.password.data(),
++                          state.password.size(), msg.data(), msg.size(),
++                          mac, &mac_len) != nullptr && mac_len == 20;
++  state.ClearPassword();
++  if (!valid) {
++    OPENSSL_cleanse(mac, sizeof(mac));
++    return false;
++  }
++  OPENSSL_memcpy(msg.data() + kSessionIdOffset + 28, mac, 4);
++  OPENSSL_memcpy(hs->session_id.data(), msg.data() + kSessionIdOffset, 32);
++  OPENSSL_cleanse(mac, sizeof(mac));
++  hs->shadow_tls_v3_hello_sealed = true;
++  return true;
++}
++
++bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
++  SSL *const ssl = hs->ssl;
++  if (hs->config->shadow_tls_v3) {
++    if (SSL_is_dtls(ssl) || SSL_is_quic(ssl) || ssl->server ||
++        ssl->session || ssl->enable_early_data ||
++        ssl->s3->initial_handshake_complete ||
++        hs->min_version < TLS1_2_VERSION ||
++        hs->config->reality_client || hs->selected_ech_config ||
++        !hs->config->client_ech_config_list.empty() ||
++        !hs->pre_shared_keys.empty() || hs->pake_prover) {
++      OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
++      return false;
++    }
++    if (!hs->shadow_tls_v3_hello_sealed) {
++      hs->session_id.ResizeForOverwrite(32);
++      if (!RAND_bytes(hs->session_id.data(), 28)) {
++        return false;
++      }
++      OPENSSL_memset(hs->session_id.data() + 28, 0, 4);
++    }
++  }
+   ScopedCBB cbb;
+   CBB body;
+   ssl_client_hello_type_t type = hs->selected_ech_config
+@@ -337,7 +390,8 @@
+     return false;
+   }
+ 
+-  if (!seal_reality_client_hello(hs, Span(msg.data(), msg.size()))) {
++  if (!seal_reality_client_hello(hs, Span(msg.data(), msg.size())) ||
++      !seal_shadow_tls_v3_client_hello(hs, Span(msg.data(), msg.size()))) {
+     return false;
+   }
+   return ssl->method->add_message(ssl, std::move(msg));
+diff --git a/ssl/handshake.cc b/ssl/handshake.cc
+--- a/ssl/handshake.cc
++++ b/ssl/handshake.cc
+@@ -760,7 +760,7 @@
+     }
+ 
+     // Run the state machine again.
+-    if (hs->config->reality_client && ssl->server) {
++    if ((hs->config->reality_client || hs->config->shadow_tls_v3) && ssl->server) {
+       OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
+       hs->wait = ssl_hs_error;
+     } else {

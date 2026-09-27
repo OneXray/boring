@@ -18,6 +18,10 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["boring/default"]
+reality = ["boring/reality"]
+shadow-tls-v3 = ["boring/shadow-tls-v3"]
+jls = ["boring/jls"]
+client-fingerprint = ["boring/client-fingerprint"]
 
 # Use a FIPS-validated version of boringssl.
 fips = ["boring/fips", "boring-sys/fips"]
@@ -31,6 +35,9 @@ boring-sys = { workspace = true, default-features = false }
 tokio = { workspace = true }
 
 [dev-dependencies]
+brotli = { workspace = true }
+flate2 = { workspace = true }
+foreign-types = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = [ "full" ] }
 anyhow = { workspace = true }

@@ -113,6 +113,10 @@ pub use self::connector::{
 pub use self::credential::{SslCredential, SslCredentialBuilder, SslCredentialRef};
 pub use self::ech::{SslEchKeys, SslEchKeysRef};
 pub use self::error::{Error, ErrorCode, HandshakeError};
+#[cfg(feature = "client-fingerprint")]
+pub use self::fingerprint::{ClientFingerprint, FingerprintConnector};
+#[cfg(feature = "reality")]
+pub use self::reality::RealityClientConfig;
 
 mod async_callbacks;
 mod bio;
@@ -122,7 +126,15 @@ mod connector;
 mod credential;
 mod ech;
 mod error;
+#[cfg(feature = "client-fingerprint")]
+mod fingerprint;
+#[cfg(feature = "jls")]
+mod jls;
 mod mut_only;
+#[cfg(feature = "reality")]
+mod reality;
+#[cfg(feature = "shadow-tls-v3")]
+mod shadow_tls;
 #[cfg(test)]
 mod test;
 
@@ -2765,6 +2777,17 @@ impl SslSessionRef {
     #[must_use]
     pub fn timeout(&self) -> u32 {
         unsafe { ffi::SSL_SESSION_get_timeout(self.as_ptr()) }
+    }
+
+    /// Returns the server's TLS 1.2 ticket lifetime hint, in seconds.
+    ///
+    /// Zero means no hint. This may be shorter than [`Self::timeout`]; an
+    /// external cache can use the nonzero minimum for its own expiry policy.
+    /// TLS 1.3 ticket lifetimes are already reflected in [`Self::timeout`].
+    #[corresponds(SSL_SESSION_get_ticket_lifetime_hint)]
+    #[must_use]
+    pub fn ticket_lifetime_hint(&self) -> u32 {
+        unsafe { ffi::SSL_SESSION_get_ticket_lifetime_hint(self.as_ptr()) }
     }
 
     /// Returns the session's TLS protocol version.
