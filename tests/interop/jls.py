@@ -2,7 +2,6 @@
 
 import argparse
 import contextlib
-import hashlib
 import json
 import shutil
 import signal
@@ -12,12 +11,10 @@ import tempfile
 import time
 from pathlib import Path
 
+from gate_report import capture_inputs, finalize_run
+
 HERE = Path(__file__).resolve().parent
 FORK = HERE.parents[1]
-
-
-def digest(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def main():
@@ -71,10 +68,8 @@ def main():
         cases=[],
         status="NOT RUN",
         cleanup=False,
-        inputs={str(p.relative_to(FORK)): digest(p) for p in inputs},
-        probe_sha256=digest(binary),
+        **capture_inputs(FORK, inputs, binary, source_identity),
     )
-    record["lab_source"] = source_identity()
     lab = None
     try:
         with exclusive_run(), contextlib.ExitStack() as stack:
@@ -303,33 +298,15 @@ def main():
         record.update(status="FAIL", failure=f"{type(error).__name__}: {error}")
         raise
     finally:
-        record["lab_source_after"] = source_identity()
-        record["source_unchanged"] = record["inputs"] == {
-            str(p.relative_to(FORK)): digest(p) for p in inputs
-        } and record["probe_sha256"] == digest(binary)
-        record["source_unchanged"] &= record["lab_source"] == record["lab_source_after"]
-        if lab:
-            remaining = [
-                p["id"]
-                for p in listing()
-                if p["configuration"].get("labels", {}).get("vcore-run") == lab.run_id
-            ]
-            record["cleanup"] = not remaining and all(
-                p.get("joined") for p in record["isolation"]["peers"]
-            )
-        (output / "results.json").write_text(json.dumps(record, indent=2) + "\n")
-        print(
-            json.dumps(
-                dict(
-                    status=record["status"],
-                    cleanup=record["cleanup"],
-                    cases=len(record["cases"]),
-                )
-            ),
-            flush=True,
+        finalize_run(
+            record,
+            fork=FORK,
+            binary=binary,
+            source_identity=source_identity,
+            lab=lab,
+            listing=listing,
+            output=output,
         )
-    if not record["cleanup"] or not record["source_unchanged"]:
-        raise RuntimeError("cleanup or input identity failed")
 
 
 if __name__ == "__main__":

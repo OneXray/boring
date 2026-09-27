@@ -3,7 +3,6 @@
 import argparse
 import base64
 import contextlib
-import hashlib
 import json
 import signal
 import shutil
@@ -13,12 +12,10 @@ import tempfile
 import time
 from pathlib import Path
 
+from gate_report import capture_inputs, digest, finalize_run
+
 HERE = Path(__file__).resolve().parent
 FORK = HERE.parents[1]
-
-
-def digest(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def main():
@@ -34,6 +31,7 @@ def main():
     from vcore_scripts.mihomo_isolation import exclusive_run
     from vcore_scripts.mihomo_release import download_mihomo
     from vcore_scripts.protocol_containers import ContainerLab, command, listing
+    from vcore_scripts.protocol_inputs import source_identity
     from vcore_scripts.protocol_streams import certificates
 
     def stop(_sig, _frame):
@@ -45,9 +43,8 @@ def main():
     record = dict(
         scope="N7 owned boring hybrid REALITY, not VCore stage acceptance",
         cases=[],
+        status="NOT RUN",
         cleanup=False,
-        probe_sha256=digest(binary),
-        lock_sha256=digest(FORK / "Cargo.lock"),
         patch_sha256=digest(FORK / "boring-sys/patches/reality-client.patch"),
     )
     source_paths = [
@@ -63,9 +60,7 @@ def main():
             "tests/interop/reality_hybrid_peer.py",
         )
     ]
-    record["inputs"] = {
-        str(path.relative_to(FORK)): digest(path) for path in source_paths
-    }
+    record.update(capture_inputs(FORK, source_paths, binary, source_identity))
     lab = None
     try:
         with exclusive_run(), contextlib.ExitStack() as stack:
@@ -284,34 +279,15 @@ def main():
         record.update(status="FAIL", failure=f"{type(error).__name__}: {error}")
         raise
     finally:
-        record["source_unchanged"] = (
-            record["inputs"]
-            == {str(path.relative_to(FORK)): digest(path) for path in source_paths}
-            and record["probe_sha256"] == digest(binary)
-            and record["lock_sha256"] == digest(FORK / "Cargo.lock")
+        finalize_run(
+            record,
+            fork=FORK,
+            binary=binary,
+            source_identity=source_identity,
+            lab=lab,
+            listing=listing,
+            output=output,
         )
-        if lab:
-            remaining = [
-                p["id"]
-                for p in listing()
-                if p["configuration"].get("labels", {}).get("vcore-run") == lab.run_id
-            ]
-            record["cleanup"] = not remaining and all(
-                p.get("joined") for p in record["isolation"]["peers"]
-            )
-        (output / "results.json").write_text(json.dumps(record, indent=2) + "\n")
-        print(
-            json.dumps(
-                dict(
-                    status=record.get("status"),
-                    cleanup=record["cleanup"],
-                    cases=len(record["cases"]),
-                )
-            ),
-            flush=True,
-        )
-    if not record["cleanup"] or not record["source_unchanged"]:
-        raise RuntimeError("container cleanup or frozen source check failed")
 
 
 if __name__ == "__main__":

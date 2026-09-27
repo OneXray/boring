@@ -59,7 +59,23 @@ diff --git a/ssl/internal.h b/ssl/internal.h
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
-@@ -2085,6 +2085,30 @@
+@@ -738,6 +738,15 @@
+ 
+   bool early_return = false;
+   int ret = ssl_run_handshake(hs, &early_return);
++  if (ret <= 0 && hs->config->jls_client) {
++    // Use the same terminal/retry distinction as the caller, including record
++    // and BIO failures that bypass the handshake state's ssl_hs_error branch.
++    const int error = SSL_get_error(ssl, ret);
++    if (error == SSL_ERROR_SSL || error == SSL_ERROR_SYSCALL ||
++        error == SSL_ERROR_ZERO_RETURN) {
++      hs->config->jls_client->ClearCredentials();
++    }
++  }
+   ssl_do_info_callback(
+       ssl, ssl->server ? SSL_CB_ACCEPT_EXIT : SSL_CB_CONNECT_EXIT, ret);
+   if (ret <= 0) {
+@@ -2085,6 +2094,30 @@
    return 1;
  }
  
@@ -90,7 +106,7 @@ diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
  int SSL_set1_shadow_tls_v3_client(SSL *ssl, const uint8_t *password,
                                  size_t password_len) {
    if (!ssl || !ssl->config || !password || password_len == 0 ||
-@@ -2093,6 +2117,7 @@
+@@ -2093,6 +2126,7 @@
        ssl->s3->initial_handshake_complete ||
        (ssl->s3->hs && ssl->s3->hs->max_version != 0) ||
        ssl->config->reality_client || ssl->config->shadow_tls_v3 ||
@@ -98,7 +114,7 @@ diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
        !ssl->config->client_ech_config_list.empty()) {
      OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
      return 0;
-@@ -2123,6 +2148,7 @@
+@@ -2123,6 +2157,7 @@
        ssl->enable_early_data || ssl->s3->initial_handshake_complete ||
        (ssl->s3->hs && ssl->s3->hs->max_version != 0) ||
        ssl->config->reality_client || ssl->config->shadow_tls_v3 ||
@@ -316,17 +332,7 @@ diff --git a/ssl/handshake.cc b/ssl/handshake.cc
    if (hs->config->reality_client) {
      if (!verify_reality_certificate(hs)) {
        hs->new_session->verify_result = X509_V_ERR_APPLICATION_VERIFICATION;
-@@ -621,6 +638,9 @@
-     switch (hs->wait) {
-       case ssl_hs_error:
-         hs->ClearRealityAuth();
-+        if (hs->config->jls_client) {
-+          hs->config->jls_client->ClearCredentials();
-+        }
-         ERR_restore_state(hs->error.get());
-         return -1;
- 
-@@ -760,7 +780,8 @@
+@@ -760,7 +777,8 @@
      }
  
      // Run the state machine again.
@@ -336,3 +342,181 @@ diff --git a/ssl/handshake.cc b/ssl/handshake.cc
        OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
        hs->wait = ssl_hs_error;
      } else {
+diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
+--- a/ssl/ssl_test.cc
++++ b/ssl/ssl_test.cc
+@@ -2082,6 +2082,174 @@
+   return true;
+ }
+ 
++// These memory-only tests retain the failed SSL object so destruction cannot
++// hide delayed JLS credential cleanup. No listener or test-only public API.
++static constexpr uint8_t kJlsTestUser[] = "synthetic-jls-user";
++static constexpr uint8_t kJlsTestPassword[] = "synthetic-jls-password";
++
++static bool ConfigureJlsTestClient(SSL *ssl) {
++  return SSL_set_min_proto_version(ssl, TLS1_2_VERSION) &&
++         SSL_set_max_proto_version(ssl, TLS1_3_VERSION) &&
++         SSL_set1_jls_client(ssl, kJlsTestUser, sizeof(kJlsTestUser) - 1,
++                            kJlsTestPassword, sizeof(kJlsTestPassword) - 1);
++}
++
++static bool CreateJlsTestClient(UniquePtr<SSL> *out_client,
++                                UniquePtr<BIO> *out_peer,
++                                size_t write_capacity = 0) {
++  UniquePtr<SSL_CTX> ctx(SSL_CTX_new(TLS_method()));
++  UniquePtr<SSL> client(ctx ? SSL_new(ctx.get()) : nullptr);
++  if (!client || !ConfigureJlsTestClient(client.get())) {
++    return false;
++  }
++  BIO *client_bio, *peer;
++  if (!BIO_new_bio_pair(&client_bio, write_capacity, &peer, 0)) {
++    return false;
++  }
++  SSL_set_bio(client.get(), client_bio, client_bio);
++  SSL_set_connect_state(client.get());
++  *out_client = std::move(client);
++  out_peer->reset(peer);
++  return true;
++}
++
++static void ExpectJlsCredentials(const SSL *ssl, bool retained) {
++  ASSERT_TRUE(ssl->config);
++  ASSERT_TRUE(ssl->config->jls_client);
++  const auto &state = *ssl->config->jls_client;
++  EXPECT_EQ(state.username.size(), retained ? sizeof(kJlsTestUser) - 1 : 0);
++  EXPECT_EQ(state.password.size(), retained ? sizeof(kJlsTestPassword) - 1 : 0);
++}
++
++TEST(SSLTest, JlsCredentialsLocalErrors) {
++  for (int kind = 0; kind < 4; kind++) {
++    SCOPED_TRACE(kind);
++    UniquePtr<SSL> client;
++    UniquePtr<BIO> peer;
++    ASSERT_TRUE(CreateJlsTestClient(&client, &peer));
++    switch (kind) {
++      case 0:
++        ASSERT_TRUE(SSL_set_max_proto_version(client.get(), TLS1_2_VERSION));
++        break;
++      case 1:
++        ASSERT_TRUE(SSL_set_min_proto_version(client.get(), TLS1_1_VERSION));
++        break;
++      case 2:
++        SSL_set_early_data_enabled(client.get(), 1);
++        break;
++      case 3:
++        SSL_set_accept_state(client.get());
++        break;
++    }
++    int ret = SSL_do_handshake(client.get());
++    ASSERT_EQ(SSL_get_error(client.get(), ret), SSL_ERROR_SSL);
++    ExpectJlsCredentials(client.get(), false);
++    EXPECT_EQ(BIO_ctrl_pending(peer.get()), 0u);
++    // A sticky failure still rejects, without relying on a second call to erase.
++    ret = SSL_do_handshake(client.get());
++    EXPECT_EQ(SSL_get_error(client.get(), ret), SSL_ERROR_SSL);
++    ExpectJlsCredentials(client.get(), false);
++  }
++}
++
++TEST(SSLTest, JlsCredentialsRecordErrors) {
++  for (const auto &record : {
++           std::vector<uint8_t>{21, 3, 3, 0, 2, 2, SSL_AD_HANDSHAKE_FAILURE},
++           std::vector<uint8_t>{21, 3, 3, 0, 2, 1, SSL_AD_CLOSE_NOTIFY},
++           std::vector<uint8_t>{127, 3, 3, 0, 1, 0},
++       }) {
++    SCOPED_TRACE(Bytes(record));
++    UniquePtr<SSL> client;
++    UniquePtr<BIO> peer;
++    ASSERT_TRUE(CreateJlsTestClient(&client, &peer));
++    int ret = SSL_connect(client.get());
++    ASSERT_EQ(SSL_get_error(client.get(), ret), SSL_ERROR_WANT_READ);
++    ExpectJlsCredentials(client.get(), true);
++    ASSERT_EQ(BIO_write(peer.get(), record.data(), record.size()),
++              static_cast<int>(record.size()));
++    ret = SSL_connect(client.get());
++    const int error = SSL_get_error(client.get(), ret);
++    ASSERT_TRUE(error == SSL_ERROR_SSL || error == SSL_ERROR_ZERO_RETURN);
++    ExpectJlsCredentials(client.get(), false);
++  }
++}
++
++TEST(SSLTest, JlsCredentialsTransportErrors) {
++  for (bool write_error : {false, true}) {
++    SCOPED_TRACE(write_error);
++    UniquePtr<SSL> client;
++    UniquePtr<BIO> peer;
++    ASSERT_TRUE(CreateJlsTestClient(&client, &peer));
++    if (!write_error) {
++      int ret = SSL_connect(client.get());
++      ASSERT_EQ(SSL_get_error(client.get(), ret), SSL_ERROR_WANT_READ);
++      ExpectJlsCredentials(client.get(), true);
++    }
++    ASSERT_TRUE(BIO_shutdown_wr(write_error ? SSL_get_wbio(client.get())
++                                           : peer.get()));
++    const int ret = SSL_connect(client.get());
++    ASSERT_EQ(SSL_get_error(client.get(), ret),
++              write_error ? SSL_ERROR_SSL : SSL_ERROR_SYSCALL);
++    ExpectJlsCredentials(client.get(), false);
++  }
++}
++
++TEST(SSLTest, JlsCredentialsSurviveReadAndWriteRetries) {
++  UniquePtr<SSL> client;
++  UniquePtr<BIO> peer;
++  ASSERT_TRUE(CreateJlsTestClient(&client, &peer, 16));
++  bool saw_write_retry = false, saw_read_retry = false;
++  for (size_t attempt = 0; attempt < 4096; attempt++) {
++    const int ret = SSL_connect(client.get());
++    const int error = SSL_get_error(client.get(), ret);
++    ExpectJlsCredentials(client.get(), true);
++    if (error == SSL_ERROR_WANT_READ) {
++      saw_read_retry = true;
++      break;
++    }
++    ASSERT_EQ(error, SSL_ERROR_WANT_WRITE);
++    saw_write_retry = true;
++    uint8_t bytes[16];
++    ASSERT_GT(BIO_read(peer.get(), bytes, sizeof(bytes)), 0);
++  }
++  ASSERT_TRUE(saw_write_retry);
++  ASSERT_TRUE(saw_read_retry);
++  for (int retry = 0; retry < 3; retry++) {
++    const int ret = SSL_connect(client.get());
++    ASSERT_EQ(SSL_get_error(client.get(), ret), SSL_ERROR_WANT_READ);
++    ExpectJlsCredentials(client.get(), true);
++  }
++}
++
++TEST(SSLTest, JlsCredentialsPeerRejections) {
++  for (int kind = 0; kind < 3; kind++) {
++    SCOPED_TRACE(kind);
++    UniquePtr<SSL_CTX> client_ctx(SSL_CTX_new(TLS_method()));
++    auto server_ctx = CreateContextWithTestCertificate(TLS_method());
++    ASSERT_TRUE(client_ctx);
++    ASSERT_TRUE(server_ctx);
++    UniquePtr<SSL> client, server;
++    ASSERT_TRUE(CreateClientAndServer(&client, &server, client_ctx.get(),
++                                     server_ctx.get()));
++    ASSERT_TRUE(ConfigureJlsTestClient(client.get()));
++    if (kind == 0) {
++      ASSERT_TRUE(SSL_set_max_proto_version(server.get(), TLS1_2_VERSION));
++    } else if (kind == 1) {
++      // Force a real HelloRetryRequest before ServerHello authentication.
++      ASSERT_TRUE(SSL_set1_curves_list(client.get(), "X25519:P-256"));
++      ASSERT_TRUE(SSL_set1_curves_list(server.get(), "P-256"));
++    }
++    int ret = SSL_connect(client.get());
++    ASSERT_EQ(SSL_get_error(client.get(), ret), SSL_ERROR_WANT_READ);
++    ExpectJlsCredentials(client.get(), true);
++    ret = SSL_accept(server.get());
++    ASSERT_EQ(SSL_get_error(server.get(), ret), SSL_ERROR_WANT_READ);
++    ret = SSL_connect(client.get());
++    ASSERT_EQ(SSL_get_error(client.get(), ret), SSL_ERROR_SSL);
++    ExpectJlsCredentials(client.get(), false);
++  }
++}
++
+ struct ClientConfig {
+   SSL_SESSION *session = nullptr;
+   STACK_OF(CRYPTO_BUFFER) *ca_names = nullptr;

@@ -6,6 +6,50 @@ JLS extension and local validation. **This new hook is not published or used
 by VCore.** Publication of the preceding ShadowTLS commit does not authorize
 publishing subsequent changes. This is a fork capability gate, not N7.4 acceptance.
 
+## PR review follow-up: terminal-error cleanup (2026-09-27)
+
+The original gate record below is historical. PR #1 found that clearing credentials
+only in the sticky `ssl_hs_error` branch left them resident after the first failed
+handshake call. Some record/BIO errors also return outside that branch. Cleanup now
+runs immediately after `ssl_run_handshake`, before the exit callback and caller
+observe a terminal `SSL_ERROR_SSL`, `SSL_ERROR_SYSCALL` or `SSL_ERROR_ZERO_RETURN`.
+Nonblocking read/write and other retry conditions keep the credentials needed to
+authenticate ServerHello. Successful ServerHello authentication and destruction
+still use the original cleansing paths; the JLS wire/authentication policy is
+unchanged.
+
+Five native `SSLTest.JlsCredentials*` regressions retain the SSL object and inspect
+only synthetic connection-owned credential lengths. They cover late configuration
+rejection, fatal/malformed records, close-notify, transport EOF/write failure,
+TLS 1.2/HRR/unauthenticated TLS 1.3 rejection, and read/write retries. Before the
+fix, four groups failed and the retry control passed; after it, all five passed in
+Debug and Release. The original first-return probe also changed from retained credentials to
+zero-length credentials without a second call or destruction. Tests use memory
+BIOs, not listeners, private-memory scanning or a test-only public credential API.
+
+From the fork root, build the patched native test target associated with the
+current Cargo invocation rather than selecting an arbitrary cached build:
+
+```bash
+set -o pipefail
+jls_native_out=$(cargo test --locked -p boring \
+  --features jls,shadow-tls-v3,client-fingerprint --test jls \
+  --no-run --message-format=json | jq -r \
+  'select(.reason == "build-script-executed" and (.package_id | contains("/boring-sys#"))) | .out_dir')
+cmake --build "$jls_native_out/build" --target ssl_test --parallel
+"$jls_native_out/build/ssl_test" --gtest_filter='SSLTest.JlsCredentials*'
+```
+
+Add `--release` to the Cargo command for the optimized native build. This does
+not run the entire upstream native test suite. The current review also reran the
+30 boring and 21 Tokio memory tests in both Debug and Release; those pass but do
+not replace platform/device or consumer dependency-integration evidence.
+
+The fresh `boring-pr1-jls-fix-20260927` official Mihomo container gate passed
+17/17 cases with `source_unchanged=true` and `cleanup=true`. See the
+[shared gate report](../tests/interop/README.md) for this run's artifact identity
+and the two other refactored harnesses' results.
+
 ## Contract and implementation
 
 The opt-in `jls` feature exposes
