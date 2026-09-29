@@ -33,6 +33,9 @@ to the issue commands.
 
 ## Wayfinding
 
+Before creating or labeling wayfinding issues, complete
+[repository label setup](triage-labels.md#repository-label-setup).
+
 - Map: one issue labelled `wayfinder:map`, containing Notes,
   Decisions-so-far and Fog.
 - Children: link tickets as GitHub sub-issues. If unavailable, use a
