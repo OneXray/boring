@@ -8,7 +8,13 @@ upstream repository metadata.
 
 - Publish: `gh issue create --repo OneXray/boring --title "..." --body-file <file>`.
 - Read: `gh issue view <number> --repo OneXray/boring --json number,title,body,labels,comments,assignees,state`.
-- List: `gh issue list --repo OneXray/boring --state open --json number,title,labels,assignees`.
+- List all open issues (one JSON object per issue; excludes pull requests):
+
+  ```sh
+  gh api --paginate 'repos/OneXray/boring/issues?state=open&per_page=100' \
+    --jq '.[] | select(.pull_request == null) | {number,title,labels,assignees}'
+  ```
+
 - Comment: `gh issue comment <number> --repo OneXray/boring --body-file <file>`.
 - Label: `gh issue edit <number> --repo OneXray/boring --add-label "..."` or `--remove-label "..."`.
 - Close: `gh issue close <number> --repo OneXray/boring --comment "..."`.
@@ -38,10 +44,15 @@ to the issue commands.
   `gh api repos/OneXray/boring/issues/<blocker> --jq .id`, then add it with
   `gh api --method POST repos/OneXray/boring/issues/<child>/dependencies/blocked_by -F issue_id=<blocker-db-id>`.
   If unavailable, record `Blocked by: #<number>` in the child body.
-- Frontier: select the first open, unassigned child in map order whose
-  blockers are all closed.
-- Claim: assign the selected ticket with
+- Allocation: one user-designated coordinator serializes task allocation.
+  It records each issue's unique agent/task owner in the map before dispatch;
+  workers start only on their explicit assignment. Confirm unclear ownership
+  with the user or coordinator before proceeding.
+- Frontier: the coordinator selects the first open, unassigned child in map
+  order with all blockers closed and no active allocation.
+- Responsibility: the assigned worker records its GitHub account with
   `gh issue edit <number> --repo OneXray/boring --add-assignee @me`
-  before implementation.
+  before implementation. Assignees record responsibility, not an exclusive
+  claim; workers sharing an account still need distinct task assignments.
 - Resolve: comment with the result, close the ticket, and append a
   summary plus link to the map's Decisions-so-far.
